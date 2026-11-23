@@ -10,6 +10,7 @@ class Usuario extends Authenticatable
     use HasApiTokens;
 
     protected $table = 'usuarios';
+    protected $rememberTokenName = '';
     protected $fillable = ['email_google', 'nombre', 'rol', 'activo'];
     protected $casts = ['activo' => 'boolean'];
 }
