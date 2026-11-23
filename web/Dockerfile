@@ -1,6 +1,3 @@
-Remove-Item web\Dockerfile* -ErrorAction SilentlyContinue
-
-@'
 FROM php:8.3-apache
 
 RUN apt-get update && apt-get install -y \
@@ -27,8 +24,3 @@ CMD php artisan storage:link --force || true && \
     php artisan migrate --force --seed && \
     sed -i "s/80/${PORT:-80}/g" /etc/apache2/sites-available/000-default.conf /etc/apache2/ports.conf && \
     apache2-foreground
-'@ | Set-Content -Path web\Dockerfile -Encoding UTF8
-
-git add web/Dockerfile
-git commit -m "fix: agregar web/Dockerfile"
-git push origin main
