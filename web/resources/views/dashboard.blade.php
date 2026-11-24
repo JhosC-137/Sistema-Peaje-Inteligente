@@ -17,6 +17,11 @@
             <span class="text-xs px-2.5 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 uppercase">
                 {{ auth()->user()->rol }}
             </span>
+            <button type="button" onclick="verificarInferencia()" id="badge-ia"
+                    class="text-xs px-2.5 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700 hover:bg-slate-700 transition"
+                    title="Clic para comprobar estado de inferencia">
+                IA: verificando...
+            </button>
         </div>
         <div class="flex items-center gap-4 text-sm">
             <span class="text-slate-400">{{ auth()->user()->nombre }} ({{ auth()->user()->email_google }})</span>
@@ -135,13 +140,20 @@
                     <h2 class="font-semibold text-indigo-400 mb-2">🤖 Agente de Consulta Inteligente</h2>
                     <div id="chat-historial" class="flex-1 overflow-y-auto space-y-3 bg-slate-950 rounded-lg p-3 text-sm border border-slate-800 mb-3">
                         <div class="text-slate-400 text-xs">
-                            Consulta placas (ej. <code class="text-indigo-300">1234ABC</code> o <code class="text-indigo-300">1234ABD</code> para probar sugerencia OCR), recaudación o alertas.
+                            Consulta placas por texto (ej. <code class="text-indigo-300">1234ABC</code> o <code class="text-indigo-300">1234ABD</code>) o adjunta la foto de una placa.
                         </div>
                     </div>
-                    <form id="form-agente" class="flex gap-2">
-                        <input type="text" id="input-pregunta" placeholder="Ej: Estado placa 1234ABC..." required
-                               class="flex-1 bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-indigo-500">
-                        <button type="submit" class="bg-indigo-600 hover:bg-indigo-500 px-4 py-2 rounded-lg text-sm font-semibold">Enviar</button>
+                    <form id="form-agente" class="space-y-2">
+                        <div class="flex gap-2">
+                            <input type="text" id="input-pregunta" placeholder="Ej: Estado placa 1234ABC..."
+                                   class="flex-1 bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-indigo-500">
+                            <label class="bg-slate-800 hover:bg-slate-700 px-3 py-2 rounded-lg text-sm cursor-pointer flex items-center" title="Adjuntar imagen de placa">
+                                📷
+                                <input type="file" id="input-imagen-agente" accept="image/*" class="hidden">
+                            </label>
+                            <button type="submit" class="bg-indigo-600 hover:bg-indigo-500 px-4 py-2 rounded-lg text-sm font-semibold">Enviar</button>
+                        </div>
+                        <p id="nombre-archivo-agente" class="text-xs text-indigo-300 hidden"></p>
                     </form>
                 </div>
 
@@ -222,6 +234,78 @@
                         <button class="sm:col-span-3 bg-indigo-600 hover:bg-indigo-500 font-semibold rounded-lg px-4 py-2">Guardar Usuario Autorizado</button>
                     </form>
                 </div>
+
+                <!-- Gestión de Tarifas y Casetas -->
+                <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
+                    <h2 class="font-semibold text-indigo-300">Admin: Tarifas por Categoría y Ejes</h2>
+                    <form method="POST" action="{{ route('tarifas.guardar') }}" class="grid grid-cols-3 gap-2 text-sm">
+                        @csrf
+                        <select name="categoria" class="bg-slate-950 border border-slate-700 rounded-lg px-3 py-2">
+                            <option value="moto">Moto</option>
+                            <option value="auto">Auto</option>
+                            <option value="minibus">Minibús</option>
+                            <option value="bus">Bus</option>
+                            <option value="camion">Camión</option>
+                        </select>
+                        <input type="number" name="ejes" value="2" min="2" max="6" required class="bg-slate-950 border border-slate-700 rounded-lg px-3 py-2">
+                        <input type="number" step="0.01" name="monto" placeholder="Bs." required class="bg-slate-950 border border-slate-700 rounded-lg px-3 py-2">
+                        <button class="col-span-3 bg-indigo-600 hover:bg-indigo-500 font-semibold rounded-lg px-4 py-2">Guardar / Actualizar Tarifa</button>
+                    </form>
+                    <div class="flex flex-wrap gap-2 text-xs text-slate-300">
+                        @foreach($tarifas as $t)
+                            <span class="px-2 py-1 rounded bg-slate-950 border border-slate-800">{{ ucfirst($t->categoria) }} ({{ $t->ejes }}e): Bs. {{ number_format($t->monto, 2) }}</span>
+                        @endforeach
+                    </div>
+                </div>
+
+                <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
+                    <h2 class="font-semibold text-indigo-300">Admin: Registrar Caseta</h2>
+                    <form method="POST" action="{{ route('casetas.guardar') }}" class="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
+                        @csrf
+                        <input type="text" name="nombre" placeholder="Nombre de caseta" required class="bg-slate-950 border border-slate-700 rounded-lg px-3 py-2">
+                        <input type="text" name="ubicacion" placeholder="Ubicación" required class="bg-slate-950 border border-slate-700 rounded-lg px-3 py-2">
+                        <button class="sm:col-span-2 bg-indigo-600 hover:bg-indigo-500 font-semibold rounded-lg px-4 py-2">Agregar Caseta</button>
+                    </form>
+                </div>
+
+                <!-- Padrón de Vehículos Registrados -->
+                <div class="lg:col-span-2 bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
+                    <div class="px-5 py-3 border-b border-slate-800 flex justify-between items-center">
+                        <h2 class="font-semibold text-indigo-300">Padrón de Vehículos ({{ $vehiculos->count() }})</h2>
+                    </div>
+                    <div class="overflow-x-auto max-h-72">
+                        <table class="w-full text-xs text-left">
+                            <thead class="bg-slate-950 text-slate-400 uppercase sticky top-0">
+                                <tr>
+                                    <th class="px-4 py-2">Placa</th>
+                                    <th class="px-4 py-2">Propietario</th>
+                                    <th class="px-4 py-2">Categoría</th>
+                                    <th class="px-4 py-2">Ejes</th>
+                                    <th class="px-4 py-2">Saldo</th>
+                                    <th class="px-4 py-2">Acción</th>
+                                </tr>
+                            </thead>
+                            <tbody class="divide-y divide-slate-800">
+                                @foreach($vehiculos as $v)
+                                    <tr>
+                                        <td class="px-4 py-2 font-mono font-bold">{{ $v->placa }}</td>
+                                        <td class="px-4 py-2">{{ $v->propietario }}</td>
+                                        <td class="px-4 py-2 capitalize">{{ $v->categoria }}</td>
+                                        <td class="px-4 py-2">{{ $v->ejes }}</td>
+                                        <td class="px-4 py-2 font-semibold {{ $v->saldo < 5 ? 'text-amber-400' : 'text-emerald-400' }}">Bs. {{ number_format($v->saldo, 2) }}</td>
+                                        <td class="px-4 py-2">
+                                            <form method="POST" action="{{ route('vehiculos.eliminar', $v) }}" onsubmit="return confirm('¿Eliminar vehículo {{ $v->placa }}?')">
+                                                @csrf
+                                                @method('DELETE')
+                                                <button class="text-red-400 hover:underline">Eliminar</button>
+                                            </form>
+                                        </td>
+                                    </tr>
+                                @endforeach
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
             </div>
         @endif
     </main>
@@ -270,29 +354,84 @@
                 } else {
                     const alertEl = document.getElementById('stat-alertas');
                     alertEl.textContent = parseInt(alertEl.textContent) + 1;
+                    const sinMsg = document.getElementById('sin-alertas-msg');
+                    if (sinMsg) sinMsg.remove();
+                    const listaAlertas = document.getElementById('lista-alertas');
+                    const tipoTxt = d.estado === 'sin_saldo' ? 'Saldo insuficiente' : 'Placa no registrada';
+                    listaAlertas.insertAdjacentHTML('afterbegin', `
+                        <div class="flex items-center justify-between bg-slate-950 border border-amber-900/50 rounded-lg p-3 text-sm">
+                            <div>
+                                <span class="font-mono font-bold text-amber-300">${d.placa}</span>
+                                <span class="text-slate-400 ml-2">• ${tipoTxt}</span>
+                                <span class="text-slate-500 text-xs ml-2">(${d.hora})</span>
+                            </div>
+                            <span class="text-xs text-amber-400">Nueva alerta</span>
+                        </div>
+                    `);
                 }
             });
         }
 
-        // 2. Chat Agente Conversacional
+        // 1b. Estado del endpoint de inferencia
+        async function verificarInferencia() {
+            const badge = document.getElementById('badge-ia');
+            badge.textContent = 'IA: verificando...';
+            try {
+                const res = await fetch("{{ route('estado.inferencia') }}");
+                const data = await res.json();
+                if (data.online) {
+                    const dev = data.detalle?.device ?? 'ok';
+                    badge.textContent = `IA: en línea (${dev})`;
+                    badge.className = 'text-xs px-2.5 py-0.5 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 transition';
+                } else {
+                    badge.textContent = `IA: desconectada`;
+                    badge.className = 'text-xs px-2.5 py-0.5 rounded-full bg-red-500/15 text-red-300 border border-red-500/30 transition';
+                }
+            } catch {
+                badge.textContent = 'IA: error';
+            }
+        }
+        verificarInferencia();
+
+        // 2. Chat Agente Conversacional (texto o imagen)
+        const inputImagenAgente = document.getElementById('input-imagen-agente');
+        const labelArchivo = document.getElementById('nombre-archivo-agente');
+        inputImagenAgente.addEventListener('change', () => {
+            if (inputImagenAgente.files.length > 0) {
+                labelArchivo.textContent = '📎 Imagen: ' + inputImagenAgente.files[0].name;
+                labelArchivo.classList.remove('hidden');
+            } else {
+                labelArchivo.classList.add('hidden');
+            }
+        });
+
         document.getElementById('form-agente').addEventListener('submit', async (e) => {
             e.preventDefault();
             const input = document.getElementById('input-pregunta');
             const pregunta = input.value.trim();
-            if (!pregunta) return;
+            const archivo = inputImagenAgente.files[0];
+            if (!pregunta && !archivo) return;
 
             const box = document.getElementById('chat-historial');
-            box.insertAdjacentHTML('beforeend', `<div class="text-right"><span class="inline-block bg-indigo-600 text-white px-3 py-1.5 rounded-xl">${pregunta}</span></div>`);
+            const textoUsuario = archivo ? `📷 [Imagen: ${archivo.name}] ${pregunta}` : pregunta;
+            box.insertAdjacentHTML('beforeend', `<div class="text-right"><span class="inline-block bg-indigo-600 text-white px-3 py-1.5 rounded-xl">${textoUsuario}</span></div>`);
             input.value = '';
+            labelArchivo.classList.add('hidden');
             box.scrollTop = box.scrollHeight;
+
+            const formData = new FormData();
+            if (pregunta) formData.append('pregunta', pregunta);
+            if (archivo) formData.append('imagen', archivo);
+            inputImagenAgente.value = '';
 
             const res = await fetch("{{ route('agente.consultar') }}", {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'X-CSRF-TOKEN': csrfToken },
-                body: JSON.stringify({ pregunta })
+                headers: { 'X-CSRF-TOKEN': csrfToken, 'Accept': 'application/json' },
+                body: formData
             });
             const data = await res.json();
-            const htmlResp = data.respuesta.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>').replace(/\n/g, '<br>');
+            const respTexto = data.respuesta ?? data.error ?? 'Sin respuesta';
+            const htmlResp = respTexto.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>').replace(/\n/g, '<br>');
             box.insertAdjacentHTML('beforeend', `<div class="bg-slate-900 border border-slate-800 p-2.5 rounded-xl text-slate-200">${htmlResp}</div>`);
             box.scrollTop = box.scrollHeight;
         });

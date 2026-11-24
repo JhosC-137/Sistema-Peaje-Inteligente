@@ -1,0 +1,143 @@
+openapi: 3.0.3
+info:
+  title: Sistema Inteligente de Control de Peaje API
+  version: 1.0.0
+  description: API REST v1 para control vehicular en casetas de peaje con visión por computadora (M1/M2/M3), tiempo real vía Pusher y agente conversacional.
+servers:
+  - url: https://sistema-peaje-inteligente.onrender.com/api/v1
+    description: Producción en Render
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: Sanctum
+security:
+  - bearerAuth: []
+paths:
+  /auth/google:
+    post:
+      summary: Autenticación móvil con Google Sign-In
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id_token]
+              properties:
+                id_token:
+                  type: string
+      responses:
+        '200':
+          description: Token Sanctum y datos del usuario autorizado
+        '401':
+          description: Token de Google inválido
+        '403':
+          description: Cuenta no autorizada en lista blanca
+  /pasos/frame:
+    post:
+      summary: Procesar frame vehicular desde caseta
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [caseta_id]
+              properties:
+                caseta_id:
+                  type: integer
+                imagen:
+                  type: string
+                  format: binary
+      responses:
+        '200':
+          description: Paso evaluado, tarifa calculada y evento Pusher emitido
+        '502':
+          description: Error al comunicarse con el servidor de inferencia IA
+  /placas/consultar:
+    post:
+      summary: Consultar estado de placa por texto
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [placa]
+              properties:
+                placa:
+                  type: string
+                  example: 1234ABC
+      responses:
+        '200':
+          description: Estado de la placa (4 estados posibles + sugerencias OCR)
+  /placas/consultar-imagen:
+    post:
+      summary: Consultar estado de placa por imagen (M1 + OCR)
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [imagen]
+              properties:
+                imagen:
+                  type: string
+                  format: binary
+      responses:
+        '200':
+          description: Placa detectada y estado en el sistema
+  /placas/{placa}/historial:
+    get:
+      summary: Historial de pasos registrados de una placa
+      parameters:
+        - name: placa
+          in: path
+          required: true
+          schema:
+            type: string
+            example: 1234ABC
+      responses:
+        '200':
+          description: Lista de pasos y ficha del vehículo si existe
+  /casetas/{id}/resumen:
+    get:
+      summary: Conteo y recaudación del día por caseta
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+            example: 1
+      responses:
+        '200':
+          description: Métricas del día para la caseta
+  /agente/chat:
+    post:
+      summary: Agente conversacional (texto o imagen)
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                pregunta:
+                  type: string
+                imagen:
+                  type: string
+                  format: binary
+      responses:
+        '200':
+          description: Respuesta del agente con datos reales de PostgreSQL
+  /estado:
+    get:
+      summary: Estado de conectividad con el servidor de inferencia (INFERENCE_URL)
+      responses:
+        '200':
+          description: Estado online/offline y detalle de modelos cargados

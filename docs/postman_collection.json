@@ -1,0 +1,90 @@
+{
+  "info": {
+    "name": "Sistema Inteligente de Control de Peaje - API v1",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url", "value": "https://sistema-peaje-inteligente.onrender.com/api/v1" },
+    { "key": "token", "value": "" }
+  ],
+  "auth": {
+    "type": "bearer",
+    "bearer": [{ "key": "token", "value": "{{token}}", "type": "string" }]
+  },
+  "item": [
+    {
+      "name": "Auth Google Móvil",
+      "request": {
+        "auth": { "type": "noauth" },
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": { "mode": "raw", "raw": "{\n  \"id_token\": \"GOOGLE_ID_TOKEN\"\n}" },
+        "url": "{{base_url}}/auth/google"
+      }
+    },
+    {
+      "name": "Procesar Frame de Caseta",
+      "request": {
+        "method": "POST",
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            { "key": "caseta_id", "value": "1", "type": "text" },
+            { "key": "imagen", "type": "file", "src": "" }
+          ]
+        },
+        "url": "{{base_url}}/pasos/frame"
+      }
+    },
+    {
+      "name": "Consultar Placa por Texto",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": { "mode": "raw", "raw": "{\n  \"placa\": \"1234ABC\"\n}" },
+        "url": "{{base_url}}/placas/consultar"
+      }
+    },
+    {
+      "name": "Consultar Placa por Imagen",
+      "request": {
+        "method": "POST",
+        "body": {
+          "mode": "formdata",
+          "formdata": [{ "key": "imagen", "type": "file", "src": "" }]
+        },
+        "url": "{{base_url}}/placas/consultar-imagen"
+      }
+    },
+    {
+      "name": "Historial de Placa",
+      "request": {
+        "method": "GET",
+        "url": "{{base_url}}/placas/1234ABC/historial"
+      }
+    },
+    {
+      "name": "Resumen Diario de Caseta",
+      "request": {
+        "method": "GET",
+        "url": "{{base_url}}/casetas/1/resumen"
+      }
+    },
+    {
+      "name": "Agente Chat",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": { "mode": "raw", "raw": "{\n  \"pregunta\": \"Estado de la placa 1234ABC\"\n}" },
+        "url": "{{base_url}}/agente/chat"
+      }
+    },
+    {
+      "name": "Estado de Inferencia",
+      "request": {
+        "method": "GET",
+        "url": "{{base_url}}/estado"
+      }
+    }
+  ]
+}

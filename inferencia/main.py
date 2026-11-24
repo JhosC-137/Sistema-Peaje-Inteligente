@@ -1,10 +1,11 @@
 import re
+import time
 import cv2
 import torch
 import numpy as np
 import onnxruntime as ort
 from pathlib import Path
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from ultralytics import YOLO
 from fast_plate_ocr import LicensePlateRecognizer
@@ -99,10 +100,11 @@ def _letterbox_384(img: np.ndarray, size: int = 384):
     return tensor, scale, dw, dh
 
 
-def detectar_placa_y_ocr(img: np.ndarray) -> tuple[str, str, float, bool]:
-    """Etapa 1: Detecta placa con YOLOv9 ONNX y lee caracteres con CCT-XS-V2."""
+def _detectar_placa_y_ocr_detalle(img: np.ndarray) -> tuple[str, str, float, bool, list[int] | None]:
+    """Etapa 1: Detecta placa con YOLOv9 ONNX, lee caracteres con CCT-XS-V2 y retorna su bbox."""
     roi = img
     placa_detectada = False
+    bbox_placa: list[int] | None = None
     h, w = img.shape[:2]
 
     if det_placas is not None:
@@ -130,9 +132,10 @@ def detectar_placa_y_ocr(img: np.ndarray) -> tuple[str, str, float, bool]:
                 if x2 > x1 and y2 > y1:
                     roi = img[y1:y2, x1:x2]
                     placa_detectada = True
+                    bbox_placa = [x1, y1, x2, y2]
 
     if ocr_placas is None or not placa_detectada:
-        return "ILEGIBLE", "ILEGIBLE", 0.0, placa_detectada
+        return "ILEGIBLE", "ILEGIBLE", 0.0, placa_detectada, bbox_placa
 
     try:
         res_ocr = ocr_placas.run(roi, return_confidence=True)
@@ -140,7 +143,7 @@ def detectar_placa_y_ocr(img: np.ndarray) -> tuple[str, str, float, bool]:
         res_ocr = ocr_placas.run(roi)
 
     if not res_ocr:
-        return "ILEGIBLE", "ILEGIBLE", 0.0, placa_detectada
+        return "ILEGIBLE", "ILEGIBLE", 0.0, placa_detectada, bbox_placa
 
     if isinstance(res_ocr, tuple) and len(res_ocr) == 2:
         lecturas, probs = res_ocr
@@ -165,10 +168,16 @@ def detectar_placa_y_ocr(img: np.ndarray) -> tuple[str, str, float, bool]:
     placa_leida = texto_raw.replace("_", "").strip()
 
     if not placa_leida:
-        return "ILEGIBLE", "ILEGIBLE", 0.0, placa_detectada
+        return "ILEGIBLE", "ILEGIBLE", 0.0, placa_detectada, bbox_placa
 
     placa_norm = normalizar_placa_bolivia(placa_leida) or "ILEGIBLE"
-    return placa_leida, placa_norm, round(confianza_ocr, 4), placa_detectada
+    return placa_leida, placa_norm, round(confianza_ocr, 4), placa_detectada, bbox_placa
+
+
+def detectar_placa_y_ocr(img: np.ndarray) -> tuple[str, str, float, bool]:
+    """Etapa 1: Detecta placa con YOLOv9 ONNX y lee caracteres con CCT-XS-V2."""
+    placa_leida, placa_norm, confianza_ocr, placa_detectada, _ = _detectar_placa_y_ocr_detalle(img)
+    return placa_leida, placa_norm, confianza_ocr, placa_detectada
 
 
 UMBRAL_CONTENCION = 0.70
@@ -263,8 +272,29 @@ def health():
     }
 
 
+@app.post("/ocr")
+async def solo_ocr(imagen: UploadFile = File(...)):
+    t0 = time.perf_counter()
+    contenido = await imagen.read()
+    arr = np.frombuffer(contenido, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+    if img is None:
+        raise HTTPException(status_code=400, detail="No se pudo decodificar la imagen enviada.")
+
+    placa_leida, placa_normalizada, confianza_ocr, m1_ok, _ = _detectar_placa_y_ocr_detalle(img)
+    return {
+        "placa_leida": placa_leida,
+        "placa_normalizada": placa_normalizada,
+        "confianza_ocr": confianza_ocr,
+        "placa_detectada": m1_ok,
+        "latencia": round((time.perf_counter() - t0) * 1000, 2),
+    }
+
+
 @app.post("/inferir")
 async def inferir(imagen: UploadFile = File(...)):
+    t0 = time.perf_counter()
     contenido = await imagen.read()
     arr = np.frombuffer(contenido, np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -275,6 +305,7 @@ async def inferir(imagen: UploadFile = File(...)):
     placa_leida, placa_normalizada, confianza_ocr, m1_ok = detectar_placa_y_ocr(img)
     categoria, conf_m2, bbox_vehiculo = clasificar_vehiculo(img)
     ejes, llantas_detectadas = contar_ejes(img, categoria, bbox_vehiculo)
+    latencia_ms = round((time.perf_counter() - t0) * 1000, 2)
 
     return {
         "placa_leida": placa_leida,
@@ -283,10 +314,60 @@ async def inferir(imagen: UploadFile = File(...)):
         "categoria_detectada": categoria,
         "ejes_detectados": ejes,
         "pasajeros": 0,
+        "latencia": latencia_ms,
         "detalles": {
             "device": DEVICE,
             "m1_placa_detectada": m1_ok,
             "m2_confianza": conf_m2,
             "m3_llantas_detectadas": llantas_detectadas,
+            "latencia_ms": latencia_ms,
         },
     }
+
+
+def analizar_frame_vigilancia(img: np.ndarray) -> dict:
+    """Ejecuta M1, M2 y M3 y devuelve cajas normalizadas (0.0 a 1.0) para overlay en vivo."""
+    h, w = img.shape[:2]
+    categoria, conf_m2, bbox_v = clasificar_vehiculo(img)
+    ejes, llantas_det = contar_ejes(img, categoria, bbox_v)
+    _, placa_norm, conf_ocr, m1_ok, bbox_p = _detectar_placa_y_ocr_detalle(img)
+
+    bbox_placa_norm = None
+    if m1_ok and bbox_p is not None and w > 0 and h > 0:
+        x1, y1, x2, y2 = bbox_p
+        bbox_placa_norm = [round(x1 / w, 4), round(y1 / h, 4), round(x2 / w, 4), round(y2 / h, 4)]
+
+    bbox_vehiculo_norm = None
+    if conf_m2 > 0.40 and w > 0 and h > 0:
+        vx1, vy1, vx2, vy2 = bbox_v
+        bbox_vehiculo_norm = [round(vx1 / w, 4), round(vy1 / h, 4), round(vx2 / w, 4), round(vy2 / h, 4)]
+
+    return {
+        "vehiculo_detectado": conf_m2 > 0.40,
+        "categoria": categoria,
+        "conf_vehiculo": conf_m2,
+        "bbox_vehiculo": bbox_vehiculo_norm,
+        "placa_detectada": m1_ok,
+        "placa": placa_norm,
+        "conf_ocr": conf_ocr,
+        "bbox_placa": bbox_placa_norm,
+        "ejes": ejes,
+        "llantas": llantas_det,
+    }
+
+
+@app.websocket("/ws/vigilancia")
+async def ws_vigilancia(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        while True:
+            frame_bytes = await websocket.receive_bytes()
+            arr = np.frombuffer(frame_bytes, np.uint8)
+            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if img is None:
+                await websocket.send_json({"error": "frame_invalido"})
+                continue
+            resultado = analizar_frame_vigilancia(img)
+            await websocket.send_json(resultado)
+    except WebSocketDisconnect:
+        pass

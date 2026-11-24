@@ -5,10 +5,12 @@ namespace App\Http\Controllers;
 use App\Models\Alerta;
 use App\Models\Caseta;
 use App\Models\Paso;
+use App\Models\Tarifa;
 use App\Models\Usuario;
 use App\Models\Vehiculo;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Http;
 
 class DashboardController extends Controller
 {
@@ -16,7 +18,8 @@ class DashboardController extends Controller
     {
         $pasos = Paso::with('caseta')->latest()->take(25)->get();
         $alertas = Alerta::with('paso.caseta')->where('atendida', false)->latest()->get();
-        $casetas = Caseta::all();
+        $casetas = Caseta::orderBy('id')->get();
+        $tarifas = Tarifa::orderBy('categoria')->orderBy('ejes')->get();
         $vehiculos = Vehiculo::orderBy('placa')->get();
         $usuarios = Auth::user()->rol === 'admin' ? Usuario::all() : collect();
 
@@ -26,7 +29,41 @@ class DashboardController extends Controller
             'alertas_pendientes' => $alertas->count(),
         ];
 
-        return view('dashboard', compact('pasos', 'alertas', 'casetas', 'vehiculos', 'usuarios', 'stats'));
+        return view('dashboard', compact('pasos', 'alertas', 'casetas', 'tarifas', 'vehiculos', 'usuarios', 'stats'));
+    }
+
+    public function estadoInferencia()
+    {
+        $inferenceUrl = config('services.inference_url') ?? env('INFERENCE_URL');
+        if (empty($inferenceUrl)) {
+            return response()->json([
+                'online' => false,
+                'url_configurada' => false,
+                'mensaje' => 'INFERENCE_URL no configurada',
+            ]);
+        }
+
+        try {
+            $res = Http::timeout(5)->get(rtrim($inferenceUrl, '/') . '/health');
+            if ($res->ok()) {
+                return response()->json([
+                    'online' => true,
+                    'url_configurada' => true,
+                    'detalle' => $res->json(),
+                ]);
+            }
+            return response()->json([
+                'online' => false,
+                'url_configurada' => true,
+                'mensaje' => 'HTTP ' . $res->status(),
+            ]);
+        } catch (\Throwable $e) {
+            return response()->json([
+                'online' => false,
+                'url_configurada' => true,
+                'mensaje' => 'Sin conexión con el servidor IA',
+            ]);
+        }
     }
 
     public function atenderAlerta(Alerta $alerta)
@@ -49,6 +86,42 @@ class DashboardController extends Controller
 
         Vehiculo::updateOrCreate(['placa' => $data['placa']], array_merge($data, ['activo' => true]));
         return back()->with('ok', "Vehículo {$data['placa']} guardado/recargado correctamente.");
+    }
+
+    public function eliminarVehiculo(Vehiculo $vehiculo)
+    {
+        abort_if(Auth::user()->rol !== 'admin', 403);
+        $placa = $vehiculo->placa;
+        $vehiculo->delete();
+        return back()->with('ok', "Vehículo {$placa} eliminado.");
+    }
+
+    public function guardarTarifa(Request $request)
+    {
+        abort_if(Auth::user()->rol !== 'admin', 403);
+        $data = $request->validate([
+            'categoria' => 'required|in:moto,auto,minibus,camion,bus',
+            'ejes' => 'required|integer|min:2|max:6',
+            'monto' => 'required|numeric|min:0',
+        ]);
+
+        Tarifa::updateOrCreate(
+            ['categoria' => $data['categoria'], 'ejes' => $data['ejes']],
+            ['monto' => $data['monto']]
+        );
+        return back()->with('ok', "Tarifa actualizada para {$data['categoria']} ({$data['ejes']} ejes).");
+    }
+
+    public function guardarCaseta(Request $request)
+    {
+        abort_if(Auth::user()->rol !== 'admin', 403);
+        $data = $request->validate([
+            'nombre' => 'required|string|max:120',
+            'ubicacion' => 'required|string|max:150',
+        ]);
+
+        Caseta::create($data);
+        return back()->with('ok', "Caseta '{$data['nombre']}' registrada.");
     }
 
     public function guardarUsuario(Request $request)

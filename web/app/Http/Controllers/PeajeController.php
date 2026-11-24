@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Events\PasoRegistrado;
 use App\Models\Alerta;
+use App\Models\Caseta;
 use App\Models\Paso;
 use App\Models\Tarifa;
 use App\Models\Vehiculo;
@@ -105,6 +106,21 @@ class PeajeController extends Controller
             'estado' => $estado,
             'paso' => $paso,
             'saldo_restante' => $vehiculo ? $vehiculo->fresh()->saldo : null,
+        ]);
+    }
+
+    public function resumenCaseta(int $id)
+    {
+        $caseta = Caseta::findOrFail($id);
+        $pasosHoy = Paso::where('caseta_id', $caseta->id)->whereDate('created_at', today());
+
+        return response()->json([
+            'caseta' => $caseta,
+            'fecha' => today()->toDateString(),
+            'total_pasos_hoy' => (clone $pasosHoy)->count(),
+            'pasos_autorizados_hoy' => (clone $pasosHoy)->where('estado', 'autorizado')->count(),
+            'recaudacion_hoy' => (float) (clone $pasosHoy)->where('estado', 'autorizado')->sum('monto'),
+            'alertas_hoy' => (clone $pasosHoy)->where('estado', '!=', 'autorizado')->count(),
         ]);
     }
 }

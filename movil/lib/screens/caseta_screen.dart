@@ -1,16 +1,98 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
+import 'dart:typed_data';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:google_sign_in/google_sign_in.dart';
+import 'package:image/image.dart' as img;
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
+import '../config.dart';
 import '../services/api_service.dart';
+import '../widgets/vigilancia_painter.dart';
+import 'consulta_screen.dart';
 import 'login_screen.dart';
 
 class CasetaItem {
   final int id;
   final String nombre;
   const CasetaItem(this.id, this.nombre);
+}
+
+class _RawFrame {
+  final int width;
+  final int height;
+  final int sensorOrientation;
+  final List<Uint8List> planes;
+  final List<int> bytesPerRow;
+  final List<int> bytesPerPixel;
+  final bool isBgra;
+
+  const _RawFrame({
+    required this.width,
+    required this.height,
+    required this.sensorOrientation,
+    required this.planes,
+    required this.bytesPerRow,
+    required this.bytesPerPixel,
+    required this.isBgra,
+  });
+}
+
+Uint8List _convertirFrameAJpeg(_RawFrame frame) {
+  img.Image decoded;
+
+  if (frame.isBgra) {
+    decoded = img.Image.fromBytes(
+      width: frame.width,
+      height: frame.height,
+      bytes: frame.planes[0].buffer,
+      order: img.ChannelOrder.bgra,
+    );
+  } else {
+    decoded = img.Image(width: frame.width, height: frame.height);
+    final yPlane = frame.planes[0];
+    final uPlane = frame.planes[1];
+    final vPlane = frame.planes[2];
+    final yStride = frame.bytesPerRow[0];
+    final uvStride = frame.bytesPerRow[1];
+    final uvPixelStride = frame.bytesPerPixel[1];
+
+    for (int y = 0; y < frame.height; y++) {
+      final yRow = y * yStride;
+      final uvRow = (y >> 1) * uvStride;
+      for (int x = 0; x < frame.width; x++) {
+        final yVal = yPlane[yRow + x];
+        final uvIndex = uvRow + (x >> 1) * uvPixelStride;
+        final uVal = uPlane[uvIndex] - 128;
+        final vVal = vPlane[uvIndex] - 128;
+
+        int r = (yVal + 1.370705 * vVal).round();
+        int g = (yVal - 0.337633 * uVal - 0.698001 * vVal).round();
+        int b = (yVal + 1.732446 * uVal).round();
+
+        decoded.setPixelRgb(
+          x,
+          y,
+          r.clamp(0, 255),
+          g.clamp(0, 255),
+          b.clamp(0, 255),
+        );
+      }
+    }
+  }
+
+  img.Image orientada = frame.sensorOrientation != 0
+      ? img.copyRotate(decoded, angle: frame.sensorOrientation)
+      : decoded;
+
+  if (orientada.width > 480) {
+    orientada = img.copyResize(orientada, width: 480);
+  }
+
+  return Uint8List.fromList(img.encodeJpg(orientada, quality: 72));
 }
 
 class CasetaScreen extends StatefulWidget {
@@ -22,13 +104,25 @@ class CasetaScreen extends StatefulWidget {
 
 class _CasetaScreenState extends State<CasetaScreen> {
   CameraController? _cameraController;
+  WebSocketChannel? _wsChannel;
+  StreamSubscription? _wsSub;
+
   bool _camaraLista = false;
   bool _procesando = false;
-  bool _modoAuto = false;
-  Timer? _timerAuto;
+  bool _modoVigilanciaActivo = false;
+  bool _wsConectado = false;
+  bool _esperandoRespuestaWs = false;
+  bool _convirtiendoFrame = false;
+  bool _registrandoPaso = false;
+
+  DateTime? _ultimoEnvioWs;
+  Uint8List? _ultimoFrameJpeg;
+  Map<String, dynamic>? _deteccionActual;
+  final Map<String, DateTime> _ultimosRegistros = {};
 
   int _casetaId = 1;
   String _operador = '';
+  String _wsUrl = AppConfig.wsVigilanciaUrl;
   dynamic _ultimoResultado;
   String? _errorMsg;
 
@@ -40,14 +134,16 @@ class _CasetaScreenState extends State<CasetaScreen> {
   @override
   void initState() {
     super.initState();
-    _cargarUsuario();
+    _cargarConfig();
     _iniciarCamara();
   }
 
-  Future<void> _cargarUsuario() async {
+  Future<void> _cargarConfig() async {
     final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
     setState(() {
       _operador = prefs.getString('user_nombre') ?? 'Operador';
+      _wsUrl = prefs.getString('ws_vigilancia_url') ?? AppConfig.wsVigilanciaUrl;
     });
   }
 
@@ -64,6 +160,9 @@ class _CasetaScreenState extends State<CasetaScreen> {
       trasera,
       ResolutionPreset.medium,
       enableAudio: false,
+      imageFormatGroup: Platform.isIOS
+          ? ImageFormatGroup.bgra8888
+          : ImageFormatGroup.yuv420,
     );
 
     await _cameraController!.initialize();
@@ -71,8 +170,196 @@ class _CasetaScreenState extends State<CasetaScreen> {
     setState(() => _camaraLista = true);
   }
 
+  Future<void> _toggleVigilancia(bool activar) async {
+    if (!_camaraLista || _cameraController == null) return;
+
+    if (!activar) {
+      await _detenerVigilancia();
+      return;
+    }
+
+    setState(() {
+      _modoVigilanciaActivo = true;
+      _errorMsg = null;
+      _deteccionActual = null;
+    });
+
+    _conectarWebSocket();
+    await _iniciarStreamCamara();
+  }
+
+  void _conectarWebSocket() {
+    _wsSub?.cancel();
+    _wsChannel?.sink.close();
+
+    try {
+      final channel = WebSocketChannel.connect(Uri.parse(_wsUrl));
+      _wsChannel = channel;
+      setState(() => _wsConectado = true);
+
+      _wsSub = channel.stream.listen(
+        _onMensajeWs,
+        onError: (err) {
+          if (!mounted) return;
+          setState(() {
+            _wsConectado = false;
+            _esperandoRespuestaWs = false;
+            _errorMsg = 'Error WebSocket: $err';
+          });
+        },
+        onDone: () {
+          if (!mounted) return;
+          setState(() {
+            _wsConectado = false;
+            _esperandoRespuestaWs = false;
+          });
+        },
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _wsConectado = false;
+        _modoVigilanciaActivo = false;
+        _errorMsg = 'No se pudo conectar al WebSocket: $e';
+      });
+    }
+  }
+
+  Future<void> _iniciarStreamCamara() async {
+    final controller = _cameraController;
+    if (controller == null || controller.value.isStreamingImages) return;
+
+    await controller.startImageStream((CameraImage image) {
+      if (!_modoVigilanciaActivo || !_wsConectado || _convirtiendoFrame) {
+        return;
+      }
+      if (_esperandoRespuestaWs) {
+        final ultimo = _ultimoEnvioWs;
+        if (ultimo == null ||
+            DateTime.now().difference(ultimo).inSeconds < 5) {
+          return;
+        }
+      }
+      _procesarYEnviarFrame(image);
+    });
+  }
+
+  Future<void> _procesarYEnviarFrame(CameraImage image) async {
+    _convirtiendoFrame = true;
+    _esperandoRespuestaWs = true;
+    _ultimoEnvioWs = DateTime.now();
+
+    try {
+      final raw = _RawFrame(
+        width: image.width,
+        height: image.height,
+        sensorOrientation: _cameraController?.description.sensorOrientation ?? 0,
+        planes: image.planes.map((p) => Uint8List.fromList(p.bytes)).toList(),
+        bytesPerRow: image.planes.map((p) => p.bytesPerRow).toList(),
+        bytesPerPixel: image.planes
+            .map((p) => p.bytesPerPixel ?? 1)
+            .toList(),
+        isBgra: image.format.group == ImageFormatGroup.bgra8888,
+      );
+
+      final jpegBytes = await Isolate.run(() => _convertirFrameAJpeg(raw));
+      if (!_modoVigilanciaActivo || _wsChannel == null) return;
+
+      _ultimoFrameJpeg = jpegBytes;
+      _wsChannel!.sink.add(jpegBytes);
+    } catch (_) {
+      _esperandoRespuestaWs = false;
+    } finally {
+      _convirtiendoFrame = false;
+    }
+  }
+
+  void _onMensajeWs(dynamic mensaje) {
+    _esperandoRespuestaWs = false;
+    if (!mounted) return;
+
+    try {
+      final decoded = jsonDecode(mensaje.toString());
+      if (decoded is! Map<String, dynamic>) return;
+
+      setState(() {
+        _deteccionActual = decoded;
+      });
+
+      final placaDetectada = decoded['placa_detectada'] == true;
+      final placa = (decoded['placa'] ?? '').toString().trim();
+      final confOcr = (decoded['conf_ocr'] as num?)?.toDouble() ?? 0.0;
+
+      if (placaDetectada &&
+          placa.isNotEmpty &&
+          placa != 'ILEGIBLE' &&
+          confOcr >= 0.75) {
+        final ahora = DateTime.now();
+        final ultimo = _ultimosRegistros[placa];
+        if ((ultimo == null || ahora.difference(ultimo).inSeconds >= 30) &&
+            !_registrandoPaso &&
+            _ultimoFrameJpeg != null) {
+          _ultimosRegistros[placa] = ahora;
+          _registrarPasoEnSegundoPlano(_ultimoFrameJpeg!, placa);
+        }
+      }
+    } catch (_) {
+      // Ignorar tramas no JSON
+    }
+  }
+
+  Future<void> _registrarPasoEnSegundoPlano(
+    Uint8List jpegBytes,
+    String placa,
+  ) async {
+    _registrandoPaso = true;
+    try {
+      final respuesta = await ApiService.enviarCapturaBytes(
+        casetaId: _casetaId,
+        jpegBytes: jpegBytes,
+      );
+      if (!mounted) return;
+      setState(() {
+        _ultimoResultado = respuesta;
+        _errorMsg = null;
+      });
+    } catch (e) {
+      // Permitir reintento si falló el envío a Laravel
+      _ultimosRegistros.remove(placa);
+      if (!mounted) return;
+      setState(() {
+        _errorMsg = e.toString().replaceFirst('Exception: ', '');
+      });
+    } finally {
+      _registrandoPaso = false;
+    }
+  }
+
+  Future<void> _detenerVigilancia() async {
+    setState(() {
+      _modoVigilanciaActivo = false;
+      _wsConectado = false;
+      _esperandoRespuestaWs = false;
+      _deteccionActual = null;
+    });
+
+    final controller = _cameraController;
+    if (controller != null && controller.value.isStreamingImages) {
+      await controller.stopImageStream();
+    }
+    await _wsSub?.cancel();
+    _wsSub = null;
+    await _wsChannel?.sink.close();
+    _wsChannel = null;
+  }
+
   Future<void> _capturarYEnviar() async {
     if (!_camaraLista || _procesando || _cameraController == null) return;
+
+    final estabaEnVigilancia = _modoVigilanciaActivo;
+    if (estabaEnVigilancia) {
+      await _detenerVigilancia();
+    }
 
     setState(() {
       _procesando = true;
@@ -97,21 +384,73 @@ class _CasetaScreenState extends State<CasetaScreen> {
       });
     } finally {
       if (mounted) setState(() => _procesando = false);
+      if (mounted && estabaEnVigilancia) {
+        await _toggleVigilancia(true);
+      }
     }
   }
 
-  void _toggleModoAuto(bool activo) {
-    setState(() => _modoAuto = activo);
-    _timerAuto?.cancel();
-    if (activo) {
-      _timerAuto = Timer.periodic(const Duration(seconds: 5), (_) {
-        if (!_procesando) _capturarYEnviar();
-      });
+  Future<void> _editarWsUrl() async {
+    final ctrl = TextEditingController(text: _wsUrl);
+    final nuevaUrl = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF0F172A),
+        title: const Text(
+          'URL WebSocket (Colab)',
+          style: TextStyle(color: Colors.white, fontSize: 16),
+        ),
+        content: TextField(
+          controller: ctrl,
+          style: const TextStyle(color: Colors.white, fontSize: 13),
+          decoration: const InputDecoration(
+            hintText: 'wss://.../ws/vigilancia',
+            hintStyle: TextStyle(color: Color(0xFF64748B)),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancelar'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
+            child: const Text('Guardar'),
+          ),
+        ],
+      ),
+    );
+    ctrl.dispose();
+
+    if (nuevaUrl == null || nuevaUrl.isEmpty) return;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('ws_vigilancia_url', nuevaUrl);
+    if (!mounted) return;
+    setState(() => _wsUrl = nuevaUrl);
+
+    if (_modoVigilanciaActivo) {
+      await _detenerVigilancia();
+      await _toggleVigilancia(true);
+    }
+  }
+
+  Future<void> _abrirConsulta() async {
+    final estabaEnVigilancia = _modoVigilanciaActivo;
+    if (estabaEnVigilancia) {
+      await _detenerVigilancia();
+    }
+    if (!mounted) return;
+    await Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => const ConsultaScreen()),
+    );
+    if (mounted && estabaEnVigilancia) {
+      await _toggleVigilancia(true);
     }
   }
 
   Future<void> _salir() async {
-    _timerAuto?.cancel();
+    await _detenerVigilancia();
     await GoogleSignIn.instance.signOut();
     await ApiService.cerrarSesion();
     if (!mounted) return;
@@ -123,13 +462,24 @@ class _CasetaScreenState extends State<CasetaScreen> {
 
   @override
   void dispose() {
-    _timerAuto?.cancel();
-    _cameraController?.dispose();
+    _wsSub?.cancel();
+    _wsChannel?.sink.close();
+    final controller = _cameraController;
+    if (controller != null && controller.value.isStreamingImages) {
+      controller.stopImageStream();
+    }
+    controller?.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    final previewAspectRatio = (_camaraLista && _cameraController != null)
+        ? (MediaQuery.of(context).orientation == Orientation.portrait
+              ? 1 / _cameraController!.value.aspectRatio
+              : _cameraController!.value.aspectRatio)
+        : 3 / 4;
+
     return Scaffold(
       backgroundColor: const Color(0xFF020617),
       appBar: AppBar(
@@ -153,6 +503,16 @@ class _CasetaScreenState extends State<CasetaScreen> {
         ),
         actions: [
           IconButton(
+            onPressed: _abrirConsulta,
+            icon: const Icon(Icons.smart_toy_outlined, color: Color(0xFF38BDF8)),
+            tooltip: 'Modo Consulta (Agente)',
+          ),
+          IconButton(
+            onPressed: _editarWsUrl,
+            icon: const Icon(Icons.link, color: Color(0xFF94A3B8)),
+            tooltip: 'Configurar WebSocket',
+          ),
+          IconButton(
             onPressed: _salir,
             icon: const Icon(Icons.logout, color: Color(0xFF94A3B8)),
             tooltip: 'Cerrar sesión',
@@ -168,7 +528,7 @@ class _CasetaScreenState extends State<CasetaScreen> {
               children: [
                 Expanded(
                   child: DropdownButtonFormField<int>(
-                    value: _casetaId,
+                    initialValue: _casetaId,
                     dropdownColor: const Color(0xFF1E293B),
                     style: const TextStyle(color: Colors.white, fontSize: 13),
                     decoration: InputDecoration(
@@ -200,20 +560,19 @@ class _CasetaScreenState extends State<CasetaScreen> {
                 Column(
                   children: [
                     const Text(
-                      'Auto 5s',
+                      'CCTV Vivo',
                       style: TextStyle(color: Color(0xFF94A3B8), fontSize: 11),
                     ),
                     Switch(
-                      value: _modoAuto,
-                      activeColor: const Color(0xFF10B981),
-                      onChanged: _toggleModoAuto,
+                      value: _modoVigilanciaActivo,
+                      activeThumbColor: const Color(0xFF10B981),
+                      onChanged: _toggleVigilancia,
                     ),
                   ],
                 ),
               ],
             ),
           ),
-
           Expanded(
             child: Container(
               margin: const EdgeInsets.all(14),
@@ -227,9 +586,61 @@ class _CasetaScreenState extends State<CasetaScreen> {
                 fit: StackFit.expand,
                 children: [
                   if (_camaraLista && _cameraController != null)
-                    CameraPreview(_cameraController!)
+                    Center(
+                      child: AspectRatio(
+                        aspectRatio: previewAspectRatio,
+                        child: Stack(
+                          fit: StackFit.expand,
+                          children: [
+                            CameraPreview(_cameraController!),
+                            if (_modoVigilanciaActivo)
+                              CustomPaint(
+                                painter: VigilanciaPainter(_deteccionActual),
+                              ),
+                          ],
+                        ),
+                      ),
+                    )
                   else
                     const Center(child: CircularProgressIndicator()),
+                  if (_modoVigilanciaActivo)
+                    Positioned(
+                      top: 10,
+                      left: 10,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 4,
+                        ),
+                        decoration: BoxDecoration(
+                          color: _wsConectado
+                              ? const Color(0xFF065F46).withValues(alpha: 0.85)
+                              : const Color(0xFF7F1D1D).withValues(alpha: 0.85),
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              Icons.circle,
+                              size: 8,
+                              color: _wsConectado
+                                  ? const Color(0xFF34D399)
+                                  : const Color(0xFFFCA5A5),
+                            ),
+                            const SizedBox(width: 6),
+                            Text(
+                              _wsConectado ? 'EN VIVO' : 'DESCONECTADO',
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 11,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
                   if (_procesando)
                     Container(
                       color: Colors.black54,
@@ -254,7 +665,6 @@ class _CasetaScreenState extends State<CasetaScreen> {
               ),
             ),
           ),
-
           if (_errorMsg != null)
             Container(
               margin: const EdgeInsets.symmetric(horizontal: 14),
@@ -268,10 +678,8 @@ class _CasetaScreenState extends State<CasetaScreen> {
                 style: const TextStyle(color: Color(0xFFFCA5A5), fontSize: 12),
               ),
             ),
-
           if (_ultimoResultado != null)
             _buildTarjetaResultado(_ultimoResultado),
-
           Padding(
             padding: const EdgeInsets.all(14),
             child: SizedBox(
@@ -310,15 +718,15 @@ class _CasetaScreenState extends State<CasetaScreen> {
 
     if (estado == 'autorizado') {
       colorBorde = const Color(0xFF10B981);
-      colorFondo = const Color(0xFF064E3B).withOpacity(0.5);
+      colorFondo = const Color(0xFF064E3B).withValues(alpha: 0.5);
       titulo = 'PASO AUTORIZADO';
     } else if (estado == 'sin_saldo') {
       colorBorde = const Color(0xFFF59E0B);
-      colorFondo = const Color(0xFF78350F).withOpacity(0.5);
+      colorFondo = const Color(0xFF78350F).withValues(alpha: 0.5);
       titulo = 'ALERTA: SALDO INSUFICIENTE';
     } else {
       colorBorde = const Color(0xFFEF4444);
-      colorFondo = const Color(0xFF7F1D1D).withOpacity(0.5);
+      colorFondo = const Color(0xFF7F1D1D).withValues(alpha: 0.5);
       titulo = 'ALERTA: PLACA NO REGISTRADA';
     }
 
