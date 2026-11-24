@@ -1,15 +1,15 @@
-import os
 import re
 import cv2
 import torch
-import easyocr
 import numpy as np
+import onnxruntime as ort
 from pathlib import Path
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from ultralytics import YOLO
+from fast_plate_ocr import LicensePlateRecognizer
 
-app = FastAPI(title="Smart Toll Inference API", version="1.0.0")
+app = FastAPI(title="Smart Toll Inference API", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,19 +21,29 @@ app.add_middleware(
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 WEIGHTS_DIR = Path(__file__).parent / "weights"
 
-# Rutas de los 3 modelos entrenados
-M1_PATH = WEIGHTS_DIR / "m1_placas.pt"
+# Rutas de modelos M1 (ONNX) y M2/M3 (YOLOv11)
+M1_DET_PATH = WEIGHTS_DIR / "yolo-v9-t-384-license-plates-end2end.onnx"
+M1_OCR_PATH = WEIGHTS_DIR / "cct_xs_v2_global.onnx"
+M1_CFG_PATH = WEIGHTS_DIR / "cct_xs_v2_global_plate_config.yaml"
 M2_PATH = WEIGHTS_DIR / "m2_vehiculos.pt"
 M3_PATH = WEIGHTS_DIR / "m3_ejes.pt"
 
-# Carga de modelos (con fallback si aún faltan M2 o M3)
-modelo_m1 = YOLO(str(M1_PATH)) if M1_PATH.exists() else None
+# Inicializar M1 Detector ONNX + OCR especializado
+providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if torch.cuda.is_available() else ["CPUExecutionProvider"]
+det_placas = ort.InferenceSession(str(M1_DET_PATH), providers=providers) if M1_DET_PATH.exists() else None
+ocr_placas = (
+    LicensePlateRecognizer(
+        onnx_model_path=str(M1_OCR_PATH),
+        plate_config_path=str(M1_CFG_PATH),
+    )
+    if (M1_OCR_PATH.exists() and M1_CFG_PATH.exists())
+    else None
+)
+
+# Inicializar M2 y M3 (con fallback hasta entrenar los pesos propios)
 modelo_m2 = YOLO(str(M2_PATH)) if M2_PATH.exists() else YOLO("yolo11n-seg.pt")
 modelo_m3 = YOLO(str(M3_PATH)) if M3_PATH.exists() else None
 
-reader_ocr = easyocr.Reader(["en"], gpu=torch.cuda.is_available())
-
-# Mapeo de clases hacia el ENUM exacto de PostgreSQL en Laravel
 MAPEO_CATEGORIAS = {
     "moto": "moto",
     "motorcycle": "moto",
@@ -51,8 +61,8 @@ MAPEO_CATEGORIAS = {
 
 
 def normalizar_placa_bolivia(texto_crudo: str) -> str:
-    """Limpia caracteres y corrige confusiones comunes en formato 1234ABC."""
-    limpio = re.sub(r"[^A-Z0-9]", "", texto_crudo.upper())
+    """Limpia padding '_' y corrige confusiones comunes en formato boliviano 1234ABC."""
+    limpio = re.sub(r"[^A-Z0-9]", "", texto_crudo.replace("_", "").upper())
     if len(limpio) == 7:
         nums = (
             limpio[:4]
@@ -76,52 +86,68 @@ def normalizar_placa_bolivia(texto_crudo: str) -> str:
     return limpio
 
 
-def preprocesar_recorte_placa(crop: np.ndarray) -> np.ndarray:
-    """Mejora contraste de la placa antes de pasarla a EasyOCR."""
-    gris = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    h, w = gris.shape
-    if w < 220:
-        escala = 220.0 / max(w, 1)
-        gris = cv2.resize(gris, None, fx=escala, fy=escala, interpolation=cv2.INTER_CUBIC)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    return clahe.apply(gris)
+def _letterbox_384(img: np.ndarray, size: int = 384):
+    h, w = img.shape[:2]
+    scale = min(size / w, size / h)
+    nw, nh = int(round(w * scale)), int(round(h * scale))
+    resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
+    canvas = np.full((size, size, 3), 114, dtype=np.uint8)
+    dw, dh = (size - nw) // 2, (size - nh) // 2
+    canvas[dh : dh + nh, dw : dw + nw] = resized
+    rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    tensor = np.transpose(rgb, (2, 0, 1))[None, ...]
+    return tensor, scale, dw, dh
 
 
 def detectar_placa_y_ocr(img: np.ndarray) -> tuple[str, str, float, bool]:
-    """Etapa 1: Detecta ROI de placa con M1 y extrae texto con EasyOCR."""
+    """Etapa 1: Detecta placa con YOLOv9 ONNX y lee caracteres con CCT-XS-V2."""
     roi = img
     placa_detectada = False
+    h, w = img.shape[:2]
 
-    if modelo_m1 is not None:
-        res_m1 = modelo_m1.predict(img, conf=0.35, device=DEVICE, verbose=False)[0]
-        if res_m1.boxes is not None and len(res_m1.boxes) > 0:
-            idx_mejor = int(res_m1.boxes.conf.argmax().item())
-            x1, y1, x2, y2 = map(int, res_m1.boxes.xyxy[idx_mejor].tolist())
-            pad = 8
-            h, w, _ = img.shape
-            x1, y1 = max(0, x1 - pad), max(0, y1 - pad)
-            x2, y2 = min(w, x2 + pad), min(h, y2 + pad)
-            if x2 > x1 and y2 > y1:
-                roi = img[y1:y2, x1:x2]
-                placa_detectada = True
+    if det_placas is not None:
+        tensor, scale, dw, dh = _letterbox_384(img, 384)
+        input_name = det_placas.get_inputs()[0].name
+        dets = det_placas.run(None, {input_name: tensor})[0]
 
-    roi_proc = preprocesar_recorte_placa(roi)
-    lecturas = reader_ocr.readtext(
-        roi_proc,
-        allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-",
-        detail=1,
-    )
+        if dets is not None and len(dets) > 0:
+            if dets.shape[-1] == 7:
+                scores = dets[:, 6]
+                boxes = dets[:, 1:5]
+            else:
+                scores = dets[:, 4]
+                boxes = dets[:, :4]
 
-    if not lecturas:
+            validos = np.where(scores >= 0.35)[0]
+            if len(validos) > 0:
+                mejor = validos[int(np.argmax(scores[validos]))]
+                bx1, by1, bx2, by2 = boxes[mejor]
+                pad = 6
+                x1 = int(max(0, (bx1 - dw) / scale - pad))
+                y1 = int(max(0, (by1 - dh) / scale - pad))
+                x2 = int(min(w, (bx2 - dw) / scale + pad))
+                y2 = int(min(h, (by2 - dh) / scale + pad))
+                if x2 > x1 and y2 > y1:
+                    roi = img[y1:y2, x1:x2]
+                    placa_detectada = True
+
+    if ocr_placas is None or not placa_detectada:
         return "ILEGIBLE", "ILEGIBLE", 0.0, placa_detectada
 
-    # Ordenar fragmentos de izquierda a derecha y concatenar
-    lecturas.sort(key=lambda item: item[0][0][0])
-    texto_bruto = "".join(item[1] for item in lecturas).strip()
-    confianza_media = float(np.mean([item[2] for item in lecturas]))
-    placa_norm = normalizar_placa_bolivia(texto_bruto) or "ILEGIBLE"
+    try:
+        lecturas, probs = ocr_placas.run(roi, return_confidence=True)
+        texto_bruto = str(lecturas[0]).replace("_", "").strip() if lecturas else ""
+        confianza = float(np.mean(probs[0])) if len(probs) > 0 else 0.0
+    except TypeError:
+        lecturas = ocr_placas.run(roi)
+        texto_bruto = str(lecturas[0]).replace("_", "").strip() if lecturas else ""
+        confianza = 0.85 if texto_bruto else 0.0
 
-    return texto_bruto, placa_norm, round(confianza_media, 4), placa_detectada
+    if not texto_bruto:
+        return "ILEGIBLE", "ILEGIBLE", 0.0, placa_detectada
+
+    placa_norm = normalizar_placa_bolivia(texto_bruto) or "ILEGIBLE"
+    return texto_bruto, placa_norm, round(confianza, 4), placa_detectada
 
 
 def clasificar_vehiculo(img: np.ndarray) -> tuple[str, float]:
@@ -130,7 +156,6 @@ def clasificar_vehiculo(img: np.ndarray) -> tuple[str, float]:
     if res_m2.boxes is None or len(res_m2.boxes) == 0:
         return "auto", 0.0
 
-    # Seleccionar el vehículo con mayor área en cuadro (el más cercano a la caseta)
     cajas = res_m2.boxes.xyxy.cpu().numpy()
     areas = (cajas[:, 2] - cajas[:, 0]) * (cajas[:, 3] - cajas[:, 1])
     idx = int(np.argmax(areas))
@@ -152,7 +177,6 @@ def contar_ejes(img: np.ndarray, categoria: str) -> tuple[int, int]:
     if res_m3.keypoints is None or len(res_m3.keypoints.xy) == 0:
         return 2, 0
 
-    # Tomar los keypoints de la instancia principal
     pts = res_m3.keypoints.xy[0].cpu().numpy()
     confs = (
         res_m3.keypoints.conf[0].cpu().numpy()
@@ -166,7 +190,6 @@ def contar_ejes(img: np.ndarray, categoria: str) -> tuple[int, int]:
     if total_llantas == 0:
         return 2, 0
 
-    # Agrupar coordenadas X muy cercanas (ej. doble eje trasero o doble detección)
     umbral_x = img.shape[1] * 0.04
     ejes_agrupados = [xs_validos[0]]
     for x in xs_validos[1:]:
@@ -186,7 +209,8 @@ def health():
         "status": "ok",
         "device": DEVICE,
         "modelos_cargados": {
-            "m1_placas": M1_PATH.exists(),
+            "m1_detector_onnx": det_placas is not None,
+            "m1_ocr_onnx": ocr_placas is not None,
             "m2_vehiculos": M2_PATH.exists(),
             "m3_ejes": M3_PATH.exists(),
         },
