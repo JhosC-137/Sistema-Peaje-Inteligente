@@ -25,11 +25,11 @@ class PeajeController extends Controller
             $imagenUrl = asset('storage/' . $path);
         }
 
-        // 1. Llamar al servidor de inferencia RunPod (o usar datos simulados si aún no está activo)
-        $inferenceUrl = env('INFERENCE_URL');
+        // 1. Llamar al servidor de inferencia (o usar datos simulados si aún no está activo)
+        $inferenceUrl = config('services.inference_url') ?? env('INFERENCE_URL');
         if (!empty($inferenceUrl) && $request->hasFile('imagen')) {
-            $response = Http::timeout(25)
-                ->attach('file', file_get_contents($request->file('imagen')->getRealPath()), 'frame.jpg')
+            $response = Http::timeout(30)
+                ->attach('imagen', file_get_contents($request->file('imagen')->getRealPath()), 'frame.jpg')
                 ->post(rtrim($inferenceUrl, '/') . '/inferir');
 
             if (!$response->ok()) {
@@ -48,11 +48,14 @@ class PeajeController extends Controller
         }
 
         // 2. Normalizar placa (solo alfanumérico en mayúsculas)
-        $placaRaw = $ia['placa_raw'] ?? '';
-        $placaNorm = preg_replace('/[^A-Z0-9]/', '', strtoupper($placaRaw));
+        $placaRaw = $ia['placa_leida'] ?? $ia['placa_raw'] ?? '';
+        $placaInput = $ia['placa_normalizada'] ?? $placaRaw;
+        $placaNorm = strtoupper($placaInput) === 'ILEGIBLE'
+            ? ''
+            : preg_replace('/[^A-Z0-9]/', '', strtoupper($placaInput));
 
-        $categoria = $ia['categoria'] ?? 'auto';
-        $ejes = max(2, (int) ($ia['ejes'] ?? 2));
+        $categoria = $ia['categoria_detectada'] ?? $ia['categoria'] ?? 'auto';
+        $ejes = max(2, (int) ($ia['ejes_detectados'] ?? $ia['ejes'] ?? 2));
         $pasajeros = (int) ($ia['pasajeros'] ?? 0);
 
         // 3. Buscar tarifa correspondiente

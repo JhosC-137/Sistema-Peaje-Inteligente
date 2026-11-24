@@ -41,4 +41,6 @@ return [
         'redirect' => env('GOOGLE_REDIRECT_URI'),
     ],
 
+    'inference_url' => env('INFERENCE_URL'),
+
 ];
