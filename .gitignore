@@ -1,3 +1,5 @@
 inferencia/weights/*.pt
 inferencia/weights/*.pt
 inferencia/weights/*.pt
+*.pt
+!inferencia/weights/*.pt

@@ -135,26 +135,52 @@ def detectar_placa_y_ocr(img: np.ndarray) -> tuple[str, str, float, bool]:
         return "ILEGIBLE", "ILEGIBLE", 0.0, placa_detectada
 
     try:
-        lecturas, probs = ocr_placas.run(roi, return_confidence=True)
-        texto_bruto = str(lecturas[0]).replace("_", "").strip() if lecturas else ""
-        confianza = float(np.mean(probs[0])) if len(probs) > 0 else 0.0
+        res_ocr = ocr_placas.run(roi, return_confidence=True)
     except TypeError:
-        lecturas = ocr_placas.run(roi)
-        texto_bruto = str(lecturas[0]).replace("_", "").strip() if lecturas else ""
-        confianza = 0.85 if texto_bruto else 0.0
+        res_ocr = ocr_placas.run(roi)
 
-    if not texto_bruto:
+    if not res_ocr:
         return "ILEGIBLE", "ILEGIBLE", 0.0, placa_detectada
 
-    placa_norm = normalizar_placa_bolivia(texto_bruto) or "ILEGIBLE"
-    return texto_bruto, placa_norm, round(confianza, 4), placa_detectada
+    if isinstance(res_ocr, tuple) and len(res_ocr) == 2:
+        lecturas, probs = res_ocr
+        texto_raw = str(lecturas[0]) if len(lecturas) > 0 else ""
+        confianza_ocr = float(np.mean(probs[0])) if len(probs) > 0 else 0.0
+    else:
+        pred = res_ocr[0]
+        if hasattr(pred, "plate"):
+            texto_raw = str(pred.plate)
+            char_probs = getattr(pred, "char_probs", None)
+            if char_probs is None:
+                char_probs = getattr(pred, "confidence", None)
+            confianza_ocr = float(np.mean(char_probs)) if char_probs is not None and len(char_probs) > 0 else 0.0
+        elif isinstance(pred, (list, tuple)) and len(pred) == 2:
+            texto_raw = str(pred[0])
+            confianza_ocr = float(np.mean(pred[1]))
+        else:
+            texto_raw = str(pred)
+            confianza_ocr = 0.0
+
+    # Eliminar caracteres de relleno '_' propios del modelo CCT
+    placa_leida = texto_raw.replace("_", "").strip()
+
+    if not placa_leida:
+        return "ILEGIBLE", "ILEGIBLE", 0.0, placa_detectada
+
+    placa_norm = normalizar_placa_bolivia(placa_leida) or "ILEGIBLE"
+    return placa_leida, placa_norm, round(confianza_ocr, 4), placa_detectada
 
 
-def clasificar_vehiculo(img: np.ndarray) -> tuple[str, float]:
-    """Etapa 2: Clasifica categoría vehicular con M2 (yolo11-seg)."""
+UMBRAL_CONTENCION = 0.70
+UMBRAL_CERCANA = 0.58
+SEPARACION_EJE = 0.52
+
+
+def clasificar_vehiculo(img: np.ndarray) -> tuple[str, float, list[float]]:
+    """Etapa 2: Retorna categoría, confianza y caja [x1, y1, x2, y2] del vehículo principal."""
     res_m2 = modelo_m2.predict(img, conf=0.40, device=DEVICE, verbose=False)[0]
     if res_m2.boxes is None or len(res_m2.boxes) == 0:
-        return "auto", 0.0
+        return "auto", 0.0, [0.0, 0.0, float(img.shape[1]), float(img.shape[0])]
 
     cajas = res_m2.boxes.xyxy.cpu().numpy()
     areas = (cajas[:, 2] - cajas[:, 0]) * (cajas[:, 3] - cajas[:, 1])
@@ -163,44 +189,64 @@ def clasificar_vehiculo(img: np.ndarray) -> tuple[str, float]:
     cls_id = int(res_m2.boxes.cls[idx].item())
     conf = float(res_m2.boxes.conf[idx].item())
     nombre_clase = str(res_m2.names[cls_id]).lower().strip()
-
     categoria = MAPEO_CATEGORIAS.get(nombre_clase, "auto")
-    return categoria, round(conf, 4)
+    return categoria, round(conf, 4), cajas[idx].tolist()
 
 
-def contar_ejes(img: np.ndarray, categoria: str) -> tuple[int, int]:
-    """Etapa 3: Detecta keypoints de llantas visibles con M3 (yolo11-pose)."""
+def _contenida(a: list[float], b: list[float]) -> float:
+    x1, y1 = max(a[0], b[0]), max(a[1], b[1])
+    x2, y2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    area = max(1e-6, (a[2] - a[0]) * (a[3] - a[1]))
+    return inter / area
+
+
+def contar_ejes(img: np.ndarray, categoria: str, bbox_vehiculo: list[float]) -> tuple[int, int]:
+    """Etapa 3: Cuenta ejes asociando los 5 keypoints de llantas al vehículo principal."""
     if modelo_m3 is None:
         return (3 if categoria == "camion" else 2), 0
 
-    res_m3 = modelo_m3.predict(img, conf=0.40, device=DEVICE, verbose=False)[0]
-    if res_m3.keypoints is None or len(res_m3.keypoints.xy) == 0:
+    res_m3 = modelo_m3.predict(img, conf=0.35, device=DEVICE, verbose=False)[0]
+    if res_m3.keypoints is None or res_m3.boxes is None or len(res_m3.boxes) == 0:
         return 2, 0
 
-    pts = res_m3.keypoints.xy[0].cpu().numpy()
-    confs = (
-        res_m3.keypoints.conf[0].cpu().numpy()
-        if res_m3.keypoints.conf is not None
-        else np.ones(len(pts))
-    )
+    cajas = res_m3.boxes.xyxy.cpu().numpy()
+    kpts_xy = res_m3.keypoints.xy.cpu().numpy()
 
-    xs_validos = sorted([float(pt[0]) for pt, c in zip(pts, confs) if c >= 0.45 and pt[0] > 0])
-    total_llantas = len(xs_validos)
+    # 1. Descartar detecciones internas (ej. aros dentro de la llanta)
+    orden = np.argsort(-((cajas[:, 2] - cajas[:, 0]) * (cajas[:, 3] - cajas[:, 1])))
+    llantas = []
+    for idx in orden:
+        box = cajas[idx].tolist()
+        if all(_contenida(box, r["box"]) < UMBRAL_CONTENCION for r in llantas):
+            llantas.append({"box": box, "kps": kpts_xy[idx]})
 
-    if total_llantas == 0:
+    # 2. Filtrar solo llantas ubicadas en la parte inferior del vehículo principal
+    vx1, vy1, vx2, vy2 = bbox_vehiculo
+    vw, vh = vx2 - vx1, vy2 - vy1
+    asociadas = [
+        l for l in llantas
+        if (vx1 - 0.05 * vw <= l["kps"][0, 0] <= vx2 + 0.05 * vw)
+        and (vy1 + 0.35 * vh <= l["kps"][0, 1] <= vy2 + 0.10 * vh)
+    ]
+    if not asociadas:
         return 2, 0
 
-    umbral_x = img.shape[1] * 0.04
-    ejes_agrupados = [xs_validos[0]]
-    for x in xs_validos[1:]:
-        if abs(x - ejes_agrupados[-1]) > umbral_x:
-            ejes_agrupados.append(x)
+    # 3. Descartar llantas del lado opuesto usando altura visible (contacto.y - superior.y)
+    alturas = [max(1.0, float(l["kps"][1, 1] - l["kps"][2, 1])) for l in asociadas]
+    hmax = max(alturas)
+    cercanas = [l for l, h in zip(asociadas, alturas) if h >= UMBRAL_CERCANA * hmax]
 
-    ejes = max(2, min(6, len(ejes_agrupados)))
+    # 4. Agrupar ruedas gemelas según el diámetro mediano de llanta
+    xs = sorted(float(l["kps"][0, 0]) for l in cercanas)
+    diam = float(np.median([max(1.0, float(l["kps"][1, 1] - l["kps"][2, 1])) for l in cercanas]))
+    ejes = 1 + sum(1 for p, q in zip(xs, xs[1:]) if (q - p) > SEPARACION_EJE * diam)
+
+    ejes = max(2, min(6, ejes))
     if categoria in ("moto", "auto", "minibus") and ejes > 2:
         ejes = 2
 
-    return ejes, total_llantas
+    return ejes, len(cercanas)
 
 
 @app.get("/health")
@@ -227,8 +273,8 @@ async def inferir(imagen: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="No se pudo decodificar la imagen enviada.")
 
     placa_leida, placa_normalizada, confianza_ocr, m1_ok = detectar_placa_y_ocr(img)
-    categoria, conf_m2 = clasificar_vehiculo(img)
-    ejes, llantas_detectadas = contar_ejes(img, categoria)
+    categoria, conf_m2, bbox_vehiculo = clasificar_vehiculo(img)
+    ejes, llantas_detectadas = contar_ejes(img, categoria, bbox_vehiculo)
 
     return {
         "placa_leida": placa_leida,
