@@ -145,8 +145,7 @@ class _CasetaScreenState extends State<CasetaScreen> {
     if (!mounted) return;
     setState(() {
       _operador = prefs.getString('user_nombre') ?? 'Operador';
-      _wsUrl =
-          prefs.getString('ws_vigilancia_url') ?? AppConfig.wsVigilanciaUrl;
+      _wsUrl = prefs.getString('ws_vigilancia_url') ?? AppConfig.wsVigilanciaUrl;
     });
   }
 
@@ -280,7 +279,8 @@ class _CasetaScreenState extends State<CasetaScreen> {
       }
       if (_esperandoRespuestaWs) {
         final ultimo = _ultimoEnvioWs;
-        if (ultimo == null || DateTime.now().difference(ultimo).inSeconds < 5) {
+        if (ultimo == null ||
+            DateTime.now().difference(ultimo).inSeconds < 5) {
           return;
         }
       }
@@ -297,11 +297,12 @@ class _CasetaScreenState extends State<CasetaScreen> {
       final raw = _RawFrame(
         width: image.width,
         height: image.height,
-        sensorOrientation:
-            _cameraController?.description.sensorOrientation ?? 0,
+        sensorOrientation: _cameraController?.description.sensorOrientation ?? 0,
         planes: image.planes.map((p) => Uint8List.fromList(p.bytes)).toList(),
         bytesPerRow: image.planes.map((p) => p.bytesPerRow).toList(),
-        bytesPerPixel: image.planes.map((p) => p.bytesPerPixel ?? 1).toList(),
+        bytesPerPixel: image.planes
+            .map((p) => p.bytesPerPixel ?? 1)
+            .toList(),
         isBgra: image.format.group == ImageFormatGroup.bgra8888,
       );
 
@@ -582,10 +583,7 @@ class _CasetaScreenState extends State<CasetaScreen> {
         actions: [
           IconButton(
             onPressed: _abrirConsulta,
-            icon: const Icon(
-              Icons.smart_toy_outlined,
-              color: Color(0xFF38BDF8),
-            ),
+            icon: const Icon(Icons.smart_toy_outlined, color: Color(0xFF38BDF8)),
             tooltip: 'Modo Consulta (Agente)',
           ),
           IconButton(
