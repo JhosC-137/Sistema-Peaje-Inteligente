@@ -10,6 +10,7 @@ use App\Models\Tarifa;
 use App\Models\Vehiculo;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Storage;
 
 class PeajeController extends Controller
 {
@@ -21,6 +22,7 @@ class PeajeController extends Controller
         ]);
 
         $imagenUrl = null;
+        $path = null;
         if ($request->hasFile('imagen')) {
             $path = $request->file('imagen')->store('evidencias', 'public');
             $imagenUrl = asset('storage/' . $path);
@@ -37,6 +39,13 @@ class PeajeController extends Controller
                 return response()->json(['error' => 'Fallo en el motor de visión IA'], 502);
             }
             $ia = $response->json();
+
+            if ($path && !empty($ia['imagen_anotada_b64'])) {
+                $binario = base64_decode($ia['imagen_anotada_b64'], true);
+                if ($binario !== false) {
+                    Storage::disk('public')->put($path, $binario);
+                }
+            }
         } else {
             // Modo prueba desde escritorio sin GPU
             $ia = [

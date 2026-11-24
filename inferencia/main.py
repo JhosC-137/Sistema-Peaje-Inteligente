@@ -1,5 +1,6 @@
 import re
 import time
+import base64
 import cv2
 import torch
 import numpy as np
@@ -185,11 +186,11 @@ UMBRAL_CERCANA = 0.58
 SEPARACION_EJE = 0.52
 
 
-def clasificar_vehiculo(img: np.ndarray) -> tuple[str, float, list[float]]:
-    """Etapa 2: Retorna categoría, confianza y caja [x1, y1, x2, y2] del vehículo principal."""
+def _clasificar_vehiculo_detalle(img: np.ndarray) -> tuple[str, float, list[float], list[list[float]] | None]:
+    """Etapa 2: Retorna categoría, confianza, caja [x1, y1, x2, y2] y polígono normalizado."""
     res_m2 = modelo_m2.predict(img, conf=0.40, device=DEVICE, verbose=False)[0]
     if res_m2.boxes is None or len(res_m2.boxes) == 0:
-        return "auto", 0.0, [0.0, 0.0, float(img.shape[1]), float(img.shape[0])]
+        return "auto", 0.0, [0.0, 0.0, float(img.shape[1]), float(img.shape[0])], None
 
     cajas = res_m2.boxes.xyxy.cpu().numpy()
     areas = (cajas[:, 2] - cajas[:, 0]) * (cajas[:, 3] - cajas[:, 1])
@@ -199,7 +200,21 @@ def clasificar_vehiculo(img: np.ndarray) -> tuple[str, float, list[float]]:
     conf = float(res_m2.boxes.conf[idx].item())
     nombre_clase = str(res_m2.names[cls_id]).lower().strip()
     categoria = MAPEO_CATEGORIAS.get(nombre_clase, "auto")
-    return categoria, round(conf, 4), cajas[idx].tolist()
+
+    mask_norm: list[list[float]] | None = None
+    if res_m2.masks is not None and idx < len(res_m2.masks.xyn):
+        poly = res_m2.masks.xyn[idx]
+        if len(poly) >= 3:
+            step = max(1, len(poly) // 36)
+            mask_norm = [[round(float(p[0]), 4), round(float(p[1]), 4)] for p in poly[::step]]
+
+    return categoria, round(conf, 4), cajas[idx].tolist(), mask_norm
+
+
+def clasificar_vehiculo(img: np.ndarray) -> tuple[str, float, list[float]]:
+    """Etapa 2: Retorna categoría, confianza y caja [x1, y1, x2, y2] del vehículo principal."""
+    categoria, conf, bbox, _ = _clasificar_vehiculo_detalle(img)
+    return categoria, conf, bbox
 
 
 def _contenida(a: list[float], b: list[float]) -> float:
@@ -210,14 +225,14 @@ def _contenida(a: list[float], b: list[float]) -> float:
     return inter / area
 
 
-def contar_ejes(img: np.ndarray, categoria: str, bbox_vehiculo: list[float]) -> tuple[int, int]:
-    """Etapa 3: Cuenta ejes asociando los 5 keypoints de llantas al vehículo principal."""
+def _contar_ejes_detalle(img: np.ndarray, categoria: str, bbox_vehiculo: list[float]) -> tuple[int, int, list[list[float]]]:
+    """Etapa 3: Cuenta ejes y retorna coordenadas [x, y] normalizadas de llantas cercanas."""
     if modelo_m3 is None:
-        return (3 if categoria == "camion" else 2), 0
+        return (3 if categoria == "camion" else 2), 0, []
 
     res_m3 = modelo_m3.predict(img, conf=0.35, device=DEVICE, verbose=False)[0]
     if res_m3.keypoints is None or res_m3.boxes is None or len(res_m3.boxes) == 0:
-        return 2, 0
+        return 2, 0, []
 
     cajas = res_m3.boxes.xyxy.cpu().numpy()
     kpts_xy = res_m3.keypoints.xy.cpu().numpy()
@@ -239,7 +254,7 @@ def contar_ejes(img: np.ndarray, categoria: str, bbox_vehiculo: list[float]) -> 
         and (vy1 + 0.35 * vh <= l["kps"][0, 1] <= vy2 + 0.10 * vh)
     ]
     if not asociadas:
-        return 2, 0
+        return 2, 0, []
 
     # 3. Descartar llantas del lado opuesto usando altura visible (contacto.y - superior.y)
     alturas = [max(1.0, float(l["kps"][1, 1] - l["kps"][2, 1])) for l in asociadas]
@@ -255,7 +270,72 @@ def contar_ejes(img: np.ndarray, categoria: str, bbox_vehiculo: list[float]) -> 
     if categoria in ("moto", "auto", "minibus") and ejes > 2:
         ejes = 2
 
-    return ejes, len(cercanas)
+    h_img, w_img = img.shape[:2]
+    puntos_norm = [
+        [round(float(l["kps"][0, 0]) / max(1, w_img), 4), round(float(l["kps"][0, 1]) / max(1, h_img), 4)]
+        for l in cercanas
+    ]
+    return ejes, len(cercanas), puntos_norm
+
+
+def contar_ejes(img: np.ndarray, categoria: str, bbox_vehiculo: list[float]) -> tuple[int, int]:
+    """Etapa 3: Cuenta ejes asociando los 5 keypoints de llantas al vehículo principal."""
+    ejes, total, _ = _contar_ejes_detalle(img, categoria, bbox_vehiculo)
+    return ejes, total
+
+
+def dibujar_detecciones(
+    img: np.ndarray,
+    categoria: str,
+    conf_m2: float,
+    bbox_v: list[float],
+    mask_v_norm: list[list[float]] | None,
+    ejes: int,
+    llantas_norm: list[list[float]],
+    placa_norm: str,
+    conf_ocr: float,
+    m1_ok: bool,
+    bbox_p: list[int] | None,
+) -> str:
+    """Dibuja segmentación/caja del vehículo, puntos de llantas y caja/texto de la placa en JPEG base64."""
+    canvas = img.copy()
+    h, w = canvas.shape[:2]
+
+    # 1. Máscara de segmentación semitransparente + caja del vehículo (M2)
+    if conf_m2 > 0.40:
+        if mask_v_norm:
+            pts = np.array([[int(p[0] * w), int(p[1] * h)] for p in mask_v_norm], dtype=np.int32)
+            overlay = canvas.copy()
+            cv2.fillPoly(overlay, [pts], (118, 230, 0))
+            cv2.addWeighted(overlay, 0.22, canvas, 0.78, 0, canvas)
+            cv2.polylines(canvas, [pts], True, (118, 230, 0), 2)
+
+        vx1, vy1, vx2, vy2 = [int(v) for v in bbox_v]
+        cv2.rectangle(canvas, (vx1, vy1), (vx2, vy2), (118, 230, 0), 2)
+        etiqueta_v = f"{categoria.upper()} | {ejes} EJES ({int(conf_m2 * 100)}%)"
+        (tw, th), _ = cv2.getTextSize(etiqueta_v, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        ty = max(th + 8, vy1)
+        cv2.rectangle(canvas, (vx1, ty - th - 8), (vx1 + tw + 10, ty), (118, 230, 0), -1)
+        cv2.putText(canvas, etiqueta_v, (vx1 + 5, ty - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+
+    # 2. Puntos de llantas detectadas (M3)
+    for lx, ly in llantas_norm:
+        cx, cy = int(lx * w), int(ly * h)
+        cv2.circle(canvas, (cx, cy), 7, (0, 165, 255), -1)
+        cv2.circle(canvas, (cx, cy), 9, (255, 255, 255), 2)
+
+    # 3. Caja de la placa + caracteres leídos (M1 + OCR)
+    if m1_ok and bbox_p is not None:
+        px1, py1, px2, py2 = [int(v) for v in bbox_p]
+        cv2.rectangle(canvas, (px1, py1), (px2, py2), (0, 214, 255), 3)
+        etiqueta_p = f"{placa_norm} ({int(conf_ocr * 100)}%)" if placa_norm and placa_norm != "ILEGIBLE" else "ILEGIBLE"
+        (pw, ph), _ = cv2.getTextSize(etiqueta_p, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
+        py_box = min(h - 4, py2 + ph + 10)
+        cv2.rectangle(canvas, (px1, py_box - ph - 8), (px1 + pw + 10, py_box), (0, 214, 255), -1)
+        cv2.putText(canvas, etiqueta_p, (px1 + 5, py_box - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 2)
+
+    ok, buf = cv2.imencode(".jpg", canvas, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    return base64.b64encode(buf.tobytes()).decode("ascii") if ok else ""
 
 
 @app.get("/health")
@@ -302,10 +382,26 @@ async def inferir(imagen: UploadFile = File(...)):
     if img is None:
         raise HTTPException(status_code=400, detail="No se pudo decodificar la imagen enviada.")
 
-    placa_leida, placa_normalizada, confianza_ocr, m1_ok = detectar_placa_y_ocr(img)
-    categoria, conf_m2, bbox_vehiculo = clasificar_vehiculo(img)
-    ejes, llantas_detectadas = contar_ejes(img, categoria, bbox_vehiculo)
+    h, w = img.shape[:2]
+    placa_leida, placa_normalizada, confianza_ocr, m1_ok, bbox_p = _detectar_placa_y_ocr_detalle(img)
+    categoria, conf_m2, bbox_vehiculo, mask_v_norm = _clasificar_vehiculo_detalle(img)
+    ejes, llantas_detectadas, llantas_norm = _contar_ejes_detalle(img, categoria, bbox_vehiculo)
+    imagen_anotada_b64 = dibujar_detecciones(
+        img, categoria, conf_m2, bbox_vehiculo, mask_v_norm, ejes, llantas_norm,
+        placa_normalizada, confianza_ocr, m1_ok, bbox_p,
+    )
     latencia_ms = round((time.perf_counter() - t0) * 1000, 2)
+
+    bbox_placa_norm = (
+        [round(bbox_p[0] / w, 4), round(bbox_p[1] / h, 4), round(bbox_p[2] / w, 4), round(bbox_p[3] / h, 4)]
+        if m1_ok and bbox_p is not None and w > 0 and h > 0
+        else None
+    )
+    bbox_vehiculo_norm = (
+        [round(bbox_vehiculo[0] / w, 4), round(bbox_vehiculo[1] / h, 4), round(bbox_vehiculo[2] / w, 4), round(bbox_vehiculo[3] / h, 4)]
+        if conf_m2 > 0.40 and w > 0 and h > 0
+        else None
+    )
 
     return {
         "placa_leida": placa_leida,
@@ -315,6 +411,9 @@ async def inferir(imagen: UploadFile = File(...)):
         "ejes_detectados": ejes,
         "pasajeros": 0,
         "latencia": latencia_ms,
+        "bbox_vehiculo": bbox_vehiculo_norm,
+        "bbox_placa": bbox_placa_norm,
+        "imagen_anotada_b64": imagen_anotada_b64,
         "detalles": {
             "device": DEVICE,
             "m1_placa_detectada": m1_ok,
@@ -326,10 +425,10 @@ async def inferir(imagen: UploadFile = File(...)):
 
 
 def analizar_frame_vigilancia(img: np.ndarray) -> dict:
-    """Ejecuta M1, M2 y M3 y devuelve cajas normalizadas (0.0 a 1.0) para overlay en vivo."""
+    """Ejecuta M1, M2 y M3 y devuelve cajas/máscaras normalizadas (0.0 a 1.0) para overlay en vivo."""
     h, w = img.shape[:2]
-    categoria, conf_m2, bbox_v = clasificar_vehiculo(img)
-    ejes, llantas_det = contar_ejes(img, categoria, bbox_v)
+    categoria, conf_m2, bbox_v, mask_v_norm = _clasificar_vehiculo_detalle(img)
+    ejes, llantas_det, llantas_norm = _contar_ejes_detalle(img, categoria, bbox_v)
     _, placa_norm, conf_ocr, m1_ok, bbox_p = _detectar_placa_y_ocr_detalle(img)
 
     bbox_placa_norm = None
@@ -347,13 +446,25 @@ def analizar_frame_vigilancia(img: np.ndarray) -> dict:
         "categoria": categoria,
         "conf_vehiculo": conf_m2,
         "bbox_vehiculo": bbox_vehiculo_norm,
+        "mask_vehiculo": mask_v_norm if conf_m2 > 0.40 else None,
         "placa_detectada": m1_ok,
         "placa": placa_norm,
         "conf_ocr": conf_ocr,
         "bbox_placa": bbox_placa_norm,
         "ejes": ejes,
         "llantas": llantas_det,
+        "llantas_puntos": llantas_norm,
     }
+
+
+@app.post("/vigilancia")
+async def vigilancia_http(imagen: UploadFile = File(...)):
+    contenido = await imagen.read()
+    arr = np.frombuffer(contenido, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise HTTPException(status_code=400, detail="Frame inválido.")
+    return analizar_frame_vigilancia(img)
 
 
 @app.websocket("/ws/vigilancia")

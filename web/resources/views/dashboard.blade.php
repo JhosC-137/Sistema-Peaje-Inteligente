@@ -377,7 +377,7 @@
             const badge = document.getElementById('badge-ia');
             badge.textContent = 'IA: verificando...';
             try {
-                const res = await fetch("{{ route('estado.inferencia') }}");
+                const res = await fetch("/estado-inferencia", { headers: { 'Accept': 'application/json' } });
                 const data = await res.json();
                 if (data.online) {
                     const dev = data.detalle?.device ?? 'ok';
@@ -405,6 +405,10 @@
             }
         });
 
+        function escaparHtml(str) {
+            return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
         document.getElementById('form-agente').addEventListener('submit', async (e) => {
             e.preventDefault();
             const input = document.getElementById('input-pregunta');
@@ -414,7 +418,7 @@
 
             const box = document.getElementById('chat-historial');
             const textoUsuario = archivo ? `📷 [Imagen: ${archivo.name}] ${pregunta}` : pregunta;
-            box.insertAdjacentHTML('beforeend', `<div class="text-right"><span class="inline-block bg-indigo-600 text-white px-3 py-1.5 rounded-xl">${textoUsuario}</span></div>`);
+            box.insertAdjacentHTML('beforeend', `<div class="text-right"><span class="inline-block bg-indigo-600 text-white px-3 py-1.5 rounded-xl">${escaparHtml(textoUsuario)}</span></div>`);
             input.value = '';
             labelArchivo.classList.add('hidden');
             box.scrollTop = box.scrollHeight;
@@ -424,15 +428,21 @@
             if (archivo) formData.append('imagen', archivo);
             inputImagenAgente.value = '';
 
-            const res = await fetch("{{ route('agente.consultar') }}", {
-                method: 'POST',
-                headers: { 'X-CSRF-TOKEN': csrfToken, 'Accept': 'application/json' },
-                body: formData
-            });
-            const data = await res.json();
-            const respTexto = data.respuesta ?? data.error ?? 'Sin respuesta';
-            const htmlResp = respTexto.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>').replace(/\n/g, '<br>');
-            box.insertAdjacentHTML('beforeend', `<div class="bg-slate-900 border border-slate-800 p-2.5 rounded-xl text-slate-200">${htmlResp}</div>`);
+            try {
+                const res = await fetch("/agente/consultar", {
+                    method: 'POST',
+                    headers: { 'X-CSRF-TOKEN': csrfToken, 'Accept': 'application/json' },
+                    body: formData
+                });
+                const raw = await res.text();
+                let data = {};
+                try { data = JSON.parse(raw); } catch {}
+                const respTexto = data.respuesta ?? data.error ?? data.message ?? `Error HTTP ${res.status}`;
+                const htmlResp = escaparHtml(respTexto).replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>').replace(/\n/g, '<br>');
+                box.insertAdjacentHTML('beforeend', `<div class="bg-slate-900 border border-slate-800 p-2.5 rounded-xl text-slate-200">${htmlResp}</div>`);
+            } catch (err) {
+                box.insertAdjacentHTML('beforeend', `<div class="bg-red-950/60 border border-red-800 p-2.5 rounded-xl text-red-300">Error de conexión con el servidor: ${escaparHtml(String(err))}</div>`);
+            }
             box.scrollTop = box.scrollHeight;
         });
 
@@ -440,7 +450,7 @@
         document.getElementById('form-simulador').addEventListener('submit', async (e) => {
             e.preventDefault();
             const formData = new FormData(e.target);
-            const res = await fetch("{{ route('peaje.simular') }}", {
+            const res = await fetch("/peaje/simular", {
                 method: 'POST',
                 headers: { 'X-CSRF-TOKEN': csrfToken, 'Accept': 'application/json' },
                 body: formData

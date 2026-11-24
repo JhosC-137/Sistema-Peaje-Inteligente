@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:google_sign_in/google_sign_in.dart';
+import 'package:http/http.dart' as http;
 import 'package:image/image.dart' as img;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
@@ -111,6 +112,7 @@ class _CasetaScreenState extends State<CasetaScreen> {
   bool _procesando = false;
   bool _modoVigilanciaActivo = false;
   bool _wsConectado = false;
+  bool _usarHttpFallback = false;
   bool _esperandoRespuestaWs = false;
   bool _convirtiendoFrame = false;
   bool _registrandoPaso = false;
@@ -143,7 +145,8 @@ class _CasetaScreenState extends State<CasetaScreen> {
     if (!mounted) return;
     setState(() {
       _operador = prefs.getString('user_nombre') ?? 'Operador';
-      _wsUrl = prefs.getString('ws_vigilancia_url') ?? AppConfig.wsVigilanciaUrl;
+      _wsUrl =
+          prefs.getString('ws_vigilancia_url') ?? AppConfig.wsVigilanciaUrl;
     });
   }
 
@@ -170,6 +173,39 @@ class _CasetaScreenState extends State<CasetaScreen> {
     setState(() => _camaraLista = true);
   }
 
+  String _normalizarWsUrl(String raw) {
+    var s = raw.trim().replaceAll('#', '');
+    while (s.endsWith('/')) {
+      s = s.substring(0, s.length - 1);
+    }
+    if (s.startsWith('https://')) {
+      s = 'wss://${s.substring(8)}';
+    } else if (s.startsWith('http://')) {
+      s = 'ws://${s.substring(7)}';
+    } else if (!s.startsWith('ws://') && !s.startsWith('wss://')) {
+      s = 'wss://$s';
+    }
+    if (s.endsWith('/vigilancia') && !s.endsWith('/ws/vigilancia')) {
+      s = '${s.substring(0, s.length - '/vigilancia'.length)}/ws/vigilancia';
+    } else if (!s.endsWith('/ws/vigilancia')) {
+      s = '$s/ws/vigilancia';
+    }
+    return s;
+  }
+
+  String _httpVigilanciaUrl() {
+    var s = _normalizarWsUrl(_wsUrl);
+    if (s.startsWith('wss://')) {
+      s = 'https://${s.substring(6)}';
+    } else if (s.startsWith('ws://')) {
+      s = 'http://${s.substring(5)}';
+    }
+    if (s.endsWith('/ws/vigilancia')) {
+      s = '${s.substring(0, s.length - '/ws/vigilancia'.length)}/vigilancia';
+    }
+    return s;
+  }
+
   Future<void> _toggleVigilancia(bool activar) async {
     if (!_camaraLista || _cameraController == null) return;
 
@@ -180,49 +216,58 @@ class _CasetaScreenState extends State<CasetaScreen> {
 
     setState(() {
       _modoVigilanciaActivo = true;
+      _usarHttpFallback = false;
       _errorMsg = null;
       _deteccionActual = null;
     });
 
-    _conectarWebSocket();
-    await _iniciarStreamCamara();
+    await _conectarWebSocket();
+    if (_modoVigilanciaActivo) {
+      await _iniciarStreamCamara();
+    }
   }
 
-  void _conectarWebSocket() {
-    _wsSub?.cancel();
-    _wsChannel?.sink.close();
+  Future<void> _conectarWebSocket() async {
+    await _wsSub?.cancel();
+    _wsSub = null;
+    await _wsChannel?.sink.close();
+    _wsChannel = null;
 
+    final url = _normalizarWsUrl(_wsUrl);
     try {
-      final channel = WebSocketChannel.connect(Uri.parse(_wsUrl));
+      final channel = WebSocketChannel.connect(Uri.parse(url));
+      await channel.ready.timeout(const Duration(seconds: 6));
+      if (!_modoVigilanciaActivo || !mounted) {
+        await channel.sink.close();
+        return;
+      }
       _wsChannel = channel;
-      setState(() => _wsConectado = true);
+      setState(() {
+        _wsConectado = true;
+        _usarHttpFallback = false;
+      });
 
       _wsSub = channel.stream.listen(
         _onMensajeWs,
-        onError: (err) {
-          if (!mounted) return;
-          setState(() {
-            _wsConectado = false;
-            _esperandoRespuestaWs = false;
-            _errorMsg = 'Error WebSocket: $err';
-          });
-        },
+        onError: (_) => _activarFallbackHttp(),
         onDone: () {
-          if (!mounted) return;
-          setState(() {
-            _wsConectado = false;
-            _esperandoRespuestaWs = false;
-          });
+          if (_modoVigilanciaActivo) _activarFallbackHttp();
         },
       );
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _wsConectado = false;
-        _modoVigilanciaActivo = false;
-        _errorMsg = 'No se pudo conectar al WebSocket: $e';
-      });
+    } catch (_) {
+      _activarFallbackHttp();
     }
+  }
+
+  void _activarFallbackHttp() {
+    if (!mounted || !_modoVigilanciaActivo) return;
+    _wsChannel = null;
+    setState(() {
+      _wsConectado = true;
+      _usarHttpFallback = true;
+      _esperandoRespuestaWs = false;
+      _errorMsg = null;
+    });
   }
 
   Future<void> _iniciarStreamCamara() async {
@@ -235,8 +280,7 @@ class _CasetaScreenState extends State<CasetaScreen> {
       }
       if (_esperandoRespuestaWs) {
         final ultimo = _ultimoEnvioWs;
-        if (ultimo == null ||
-            DateTime.now().difference(ultimo).inSeconds < 5) {
+        if (ultimo == null || DateTime.now().difference(ultimo).inSeconds < 5) {
           return;
         }
       }
@@ -253,22 +297,56 @@ class _CasetaScreenState extends State<CasetaScreen> {
       final raw = _RawFrame(
         width: image.width,
         height: image.height,
-        sensorOrientation: _cameraController?.description.sensorOrientation ?? 0,
+        sensorOrientation:
+            _cameraController?.description.sensorOrientation ?? 0,
         planes: image.planes.map((p) => Uint8List.fromList(p.bytes)).toList(),
         bytesPerRow: image.planes.map((p) => p.bytesPerRow).toList(),
-        bytesPerPixel: image.planes
-            .map((p) => p.bytesPerPixel ?? 1)
-            .toList(),
+        bytesPerPixel: image.planes.map((p) => p.bytesPerPixel ?? 1).toList(),
         isBgra: image.format.group == ImageFormatGroup.bgra8888,
       );
 
       final jpegBytes = await Isolate.run(() => _convertirFrameAJpeg(raw));
-      if (!_modoVigilanciaActivo || _wsChannel == null) return;
+      if (!_modoVigilanciaActivo) return;
 
       _ultimoFrameJpeg = jpegBytes;
-      _wsChannel!.sink.add(jpegBytes);
-    } catch (_) {
+
+      if (_usarHttpFallback) {
+        final req = http.MultipartRequest(
+          'POST',
+          Uri.parse(_httpVigilanciaUrl()),
+        );
+        req.files.add(
+          http.MultipartFile.fromBytes(
+            'imagen',
+            jpegBytes,
+            filename: 'frame.jpg',
+          ),
+        );
+        final streamed = await req.send().timeout(const Duration(seconds: 10));
+        final body = await streamed.stream.bytesToString();
+        if (streamed.statusCode == 200) {
+          _onMensajeWs(body);
+        } else {
+          _esperandoRespuestaWs = false;
+          if (mounted) {
+            setState(() {
+              _errorMsg =
+                  'Servidor IA (${streamed.statusCode}). Revisa URL en el ícono 🔗.';
+            });
+          }
+        }
+      } else if (_wsChannel != null) {
+        _wsChannel!.sink.add(jpegBytes);
+      } else {
+        _esperandoRespuestaWs = false;
+      }
+    } catch (e) {
       _esperandoRespuestaWs = false;
+      if (_usarHttpFallback && mounted) {
+        setState(() {
+          _errorMsg = 'Sin conexión con Colab. Actualiza la URL en 🔗.';
+        });
+      }
     } finally {
       _convirtiendoFrame = false;
     }
@@ -504,7 +582,10 @@ class _CasetaScreenState extends State<CasetaScreen> {
         actions: [
           IconButton(
             onPressed: _abrirConsulta,
-            icon: const Icon(Icons.smart_toy_outlined, color: Color(0xFF38BDF8)),
+            icon: const Icon(
+              Icons.smart_toy_outlined,
+              color: Color(0xFF38BDF8),
+            ),
             tooltip: 'Modo Consulta (Agente)',
           ),
           IconButton(
@@ -630,7 +711,11 @@ class _CasetaScreenState extends State<CasetaScreen> {
                             ),
                             const SizedBox(width: 6),
                             Text(
-                              _wsConectado ? 'EN VIVO' : 'DESCONECTADO',
+                              _wsConectado
+                                  ? (_usarHttpFallback
+                                        ? 'EN VIVO (HTTP)'
+                                        : 'EN VIVO')
+                                  : 'DESCONECTADO',
                               style: const TextStyle(
                                 color: Colors.white,
                                 fontSize: 11,
@@ -707,10 +792,23 @@ class _CasetaScreenState extends State<CasetaScreen> {
     );
   }
 
+  void _verImagenAnotada(String url) {
+    showDialog(
+      context: context,
+      builder: (_) => Dialog(
+        backgroundColor: Colors.black,
+        child: InteractiveViewer(
+          child: Image.network(url, fit: BoxFit.contain),
+        ),
+      ),
+    );
+  }
+
   Widget _buildTarjetaResultado(dynamic data) {
     final estado = data['estado'] ?? 'no_registrada';
     final paso = data['paso'] ?? {};
     final saldo = data['saldo_restante'];
+    final imagenUrl = paso['imagen_url']?.toString();
 
     Color colorBorde;
     Color colorFondo;
@@ -741,31 +839,53 @@ class _CasetaScreenState extends State<CasetaScreen> {
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                titulo,
-                style: TextStyle(
-                  color: colorBorde,
-                  fontWeight: FontWeight.bold,
-                  fontSize: 12,
+          if (imagenUrl != null && imagenUrl.isNotEmpty)
+            GestureDetector(
+              onTap: () => _verImagenAnotada(imagenUrl),
+              child: Padding(
+                padding: const EdgeInsets.only(right: 12),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(8),
+                  child: Image.network(
+                    imagenUrl,
+                    width: 60,
+                    height: 60,
+                    fit: BoxFit.cover,
+                    errorBuilder: (_, _, _) => const SizedBox.shrink(),
+                  ),
                 ),
               ),
-              const SizedBox(height: 4),
-              Text(
-                'Placa: ${paso['placa_normalizada'] ?? 'ILEGIBLE'}',
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 18,
-                  fontWeight: FontWeight.bold,
+            ),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  titulo,
+                  style: TextStyle(
+                    color: colorBorde,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 12,
+                  ),
                 ),
-              ),
-              Text(
-                '${(paso['categoria_detectada'] ?? '').toString().toUpperCase()} • ${paso['ejes_detectados'] ?? 2} ejes • Bs. ${paso['monto']}',
-                style: const TextStyle(color: Color(0xFFCBD5E1), fontSize: 12),
-              ),
-            ],
+                const SizedBox(height: 4),
+                Text(
+                  'Placa: ${paso['placa_normalizada'] ?? 'ILEGIBLE'}',
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                Text(
+                  '${(paso['categoria_detectada'] ?? '').toString().toUpperCase()} • ${paso['ejes_detectados'] ?? 2} ejes • Bs. ${paso['monto']}',
+                  style: const TextStyle(
+                    color: Color(0xFFCBD5E1),
+                    fontSize: 12,
+                  ),
+                ),
+              ],
+            ),
           ),
           if (saldo != null)
             Column(
