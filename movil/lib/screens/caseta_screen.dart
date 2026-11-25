@@ -541,18 +541,22 @@ class _CasetaScreenState extends State<CasetaScreen> {
       builder: (ctx) => AlertDialog(
         backgroundColor: const Color(0xFF0F172A),
         title: const Text(
-          'URL WebSocket (Colab)',
+          'URL Inferencia (Colab / RunPod)',
           style: TextStyle(color: Colors.white, fontSize: 16),
         ),
         content: TextField(
           controller: ctrl,
           style: const TextStyle(color: Colors.white, fontSize: 13),
           decoration: const InputDecoration(
-            hintText: 'wss://.../ws/vigilancia',
+            hintText: 'https://...-8000.proxy.runpod.net',
             hintStyle: TextStyle(color: Color(0xFF64748B)),
           ),
         ),
         actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, '__AUTO__'),
+            child: const Text('Auto (Render)'),
+          ),
           TextButton(
             onPressed: () => Navigator.pop(ctx),
             child: const Text('Cancelar'),
@@ -566,11 +570,21 @@ class _CasetaScreenState extends State<CasetaScreen> {
     );
     ctrl.dispose();
 
-    if (nuevaUrl == null || nuevaUrl.isEmpty) return;
+    if (nuevaUrl == null) return;
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('ws_vigilancia_url', nuevaUrl);
-    if (!mounted) return;
-    setState(() => _wsUrl = nuevaUrl);
+    if (nuevaUrl == '__AUTO__' || nuevaUrl.isEmpty) {
+      await prefs.remove('ws_vigilancia_url');
+      final remota = await ApiService.obtenerInferenceUrl();
+      if (!mounted) return;
+      setState(() {
+        _wsUrl = _normalizarWsUrl(remota ?? AppConfig.wsVigilanciaUrl);
+      });
+    } else {
+      final norm = _normalizarWsUrl(nuevaUrl);
+      await prefs.setString('ws_vigilancia_url', norm);
+      if (!mounted) return;
+      setState(() => _wsUrl = norm);
+    }
 
     if (_modoVigilanciaActivo) {
       await _detenerVigilancia();
