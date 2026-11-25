@@ -52,9 +52,15 @@ Uint8List _convertirFrameAJpeg(_RawFrame frame) {
       order: img.ChannelOrder.bgra,
     );
   } else if (frame.planes.length >= 3) {
-    final step = frame.width > 1280 ? 2 : 1;
-    final outW = (frame.width + step - 1) ~/ step;
-    final outH = (frame.height + step - 1) ~/ step;
+    final step = frame.width >= 960 ? 2 : 1;
+    final srcW = (frame.width + step - 1) ~/ step;
+    final srcH = (frame.height + step - 1) ~/ step;
+    final rot90 = frame.sensorOrientation == 90;
+    final rot270 = frame.sensorOrientation == 270;
+    final rot180 = frame.sensorOrientation == 180;
+    final outW = (rot90 || rot270) ? srcH : srcW;
+    final outH = (rot90 || rot270) ? srcW : srcH;
+
     decoded = img.Image(width: outW, height: outH);
     final yPlane = frame.planes[0];
     final uPlane = frame.planes[1];
@@ -64,32 +70,53 @@ Uint8List _convertirFrameAJpeg(_RawFrame frame) {
     final vStride = frame.bytesPerRow[2];
     final uPixelStride = frame.bytesPerPixel[1];
     final vPixelStride = frame.bytesPerPixel[2];
+    final yLen = yPlane.length;
+    final uLen = uPlane.length;
+    final vLen = vPlane.length;
 
-    for (int dy = 0, y = 0; y < frame.height; dy++, y += step) {
+    for (int sy = 0, y = 0; y < frame.height; sy++, y += step) {
       final yRow = y * yStride;
       final uRow = (y >> 1) * uStride;
       final vRow = (y >> 1) * vStride;
-      for (int dx = 0, x = 0; x < frame.width; dx++, x += step) {
+      for (int sx = 0, x = 0; x < frame.width; sx++, x += step) {
         final yIdx = yRow + x;
         final uIdx = uRow + (x >> 1) * uPixelStride;
         final vIdx = vRow + (x >> 1) * vPixelStride;
-        final yVal = yIdx < yPlane.length ? yPlane[yIdx] : 0;
-        final uVal = (uIdx < uPlane.length ? uPlane[uIdx] : 128) - 128;
-        final vVal = (vIdx < vPlane.length ? vPlane[vIdx] : 128) - 128;
+        final yVal = yIdx < yLen ? yPlane[yIdx] : 0;
+        final uVal = (uIdx < uLen ? uPlane[uIdx] : 128) - 128;
+        final vVal = (vIdx < vLen ? vPlane[vIdx] : 128) - 128;
 
-        int r = (yVal + 1.370705 * vVal).round();
-        int g = (yVal - 0.337633 * uVal - 0.698001 * vVal).round();
-        int b = (yVal + 1.732446 * uVal).round();
+        // Conversión YUV->RGB con aritmética entera (sin punto flotante por píxel)
+        int r = yVal + ((1436 * vVal) >> 10);
+        int g = yVal - ((352 * uVal + 731 * vVal) >> 10);
+        int b = yVal + ((1815 * uVal) >> 10);
+        final cr = r < 0 ? 0 : (r > 255 ? 255 : r);
+        final cg = g < 0 ? 0 : (g > 255 ? 255 : g);
+        final cb = b < 0 ? 0 : (b > 255 ? 255 : b);
 
-        decoded.setPixelRgb(
-          dx,
-          dy,
-          r.clamp(0, 255),
-          g.clamp(0, 255),
-          b.clamp(0, 255),
-        );
+        final int dx;
+        final int dy;
+        if (rot90) {
+          dx = srcH - 1 - sy;
+          dy = sx;
+        } else if (rot270) {
+          dx = sy;
+          dy = srcW - 1 - sx;
+        } else if (rot180) {
+          dx = srcW - 1 - sx;
+          dy = srcH - 1 - sy;
+        } else {
+          dx = sx;
+          dy = sy;
+        }
+        decoded.setPixelRgb(dx, dy, cr, cg, cb);
       }
     }
+
+    if (decoded.width > 480) {
+      decoded = img.copyResize(decoded, width: 480);
+    }
+    return Uint8List.fromList(img.encodeJpg(decoded, quality: 58));
   } else {
     // Fallback para formatos de 1 o 2 planos (ej. NV21 / Y solo)
     decoded = img.Image(width: frame.width, height: frame.height);
@@ -133,11 +160,11 @@ Uint8List _convertirFrameAJpeg(_RawFrame frame) {
       ? img.copyRotate(decoded, angle: frame.sensorOrientation)
       : decoded;
 
-  if (orientada.width > 640) {
-    orientada = img.copyResize(orientada, width: 640);
+  if (orientada.width > 480) {
+    orientada = img.copyResize(orientada, width: 480);
   }
 
-  return Uint8List.fromList(img.encodeJpg(orientada, quality: 65));
+  return Uint8List.fromList(img.encodeJpg(orientada, quality: 58));
 }
 
 class CasetaScreen extends StatefulWidget {

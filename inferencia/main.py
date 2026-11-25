@@ -315,15 +315,15 @@ def contar_ejes_en_recorte(
 
 
 def segmentar_pasajeros_en_recorte(
-    crop_v: np.ndarray, imgsz: int = 320
+    crop_v: np.ndarray, imgsz: int = 416
 ) -> tuple[int, list[list[list[float]]]]:
-    """Etapa 4: Segmenta y cuenta pasajeros visibles dentro de la cabina (55% superior, sin rostros)."""
+    """Etapa 4: Segmenta y cuenta pasajeros visibles dentro del vehículo (sin rostros)."""
     ch, cw = crop_v.shape[:2]
-    if ch < 40 or cw < 40 or modelo_pasajeros is None:
+    if ch < 35 or cw < 35 or modelo_pasajeros is None:
         return 0, []
 
     res_p = modelo_pasajeros.predict(
-        crop_v, imgsz=imgsz, conf=0.35, device=DEVICE, half=USE_HALF, verbose=False
+        crop_v, imgsz=imgsz, conf=0.20, device=DEVICE, half=USE_HALF, verbose=False
     )[0]
     if res_p.boxes is None or len(res_p.boxes) == 0:
         return 0, []
@@ -336,8 +336,8 @@ def segmentar_pasajeros_en_recorte(
         px1, py1, px2, py2 = box.tolist()
         cy = (py1 + py2) / 2.0
         area_rel = ((px2 - px1) * (py2 - py1)) / max(1.0, cw * ch)
-        # Filtrar exclusivamente el 58% superior del vehículo (zona de parabrisas/ventanas)
-        if cy > ch * 0.58 or area_rel < 0.003:
+        # Filtrar zona de cabina/ventanas (78% superior) y descartar ruido diminuto
+        if cy > ch * 0.78 or area_rel < 0.001:
             continue
 
         if masks_xyn is not None and i < len(masks_xyn) and len(masks_xyn[i]) >= 3:
@@ -437,13 +437,14 @@ rastreador_http = RastreadorVigilancia()
 
 
 def _procesar_vehiculos_crop_first(
-    img: np.ndarray, max_vehiculos: int = 2, imgsz_m2: int = 416, imgsz_m3: int = 384, imgsz_m4: int = 320
+    img: np.ndarray, max_vehiculos: int = 2, imgsz_m2: int = 384, imgsz_m3: int = 320, imgsz_m4: int = 416
 ) -> list[dict]:
-    """Detecta todos los vehículos con M2 (solo caja) y procesa ejes, placa y pasajeros por recorte."""
+    """Detecta todos los vehículos con M2 y procesa ejes, placa y pasajeros por recorte."""
     h, w = img.shape[:2]
-    res_m2 = modelo_m2.predict(
-        img, imgsz=imgsz_m2, conf=0.30, iou=0.50, device=DEVICE, half=USE_HALF, verbose=False
-    )[0]
+    with torch.inference_mode():
+        res_m2 = modelo_m2.predict(
+            img, imgsz=imgsz_m2, conf=0.30, iou=0.50, device=DEVICE, half=USE_HALF, verbose=False
+        )[0]
 
     detecciones: list[dict] = []
     if res_m2.boxes is not None and len(res_m2.boxes) > 0:
@@ -468,11 +469,12 @@ def _procesar_vehiculos_crop_first(
             cw = max(1, cx2 - cx1)
             ch = max(1, cy2 - cy1)
 
-            ejes, llantas_det, pts_rel, lboxes_rel, kpts_ejes_rel = contar_ejes_en_recorte(
-                crop_v, categoria, imgsz=imgsz_m3
-            )
-            placa_leida, placa_norm, conf_ocr, m1_ok, bbox_p_crop = _detectar_placa_y_ocr_detalle(crop_v)
-            pasajeros, mascaras_pas_rel = segmentar_pasajeros_en_recorte(crop_v, imgsz=imgsz_m4)
+            with torch.inference_mode():
+                ejes, llantas_det, pts_rel, lboxes_rel, kpts_ejes_rel = contar_ejes_en_recorte(
+                    crop_v, categoria, imgsz=imgsz_m3
+                )
+                placa_leida, placa_norm, conf_ocr, m1_ok, bbox_p_crop = _detectar_placa_y_ocr_detalle(crop_v)
+                pasajeros, mascaras_pas_rel = segmentar_pasajeros_en_recorte(crop_v, imgsz=imgsz_m4)
 
             bbox_placa_norm = None
             if m1_ok and bbox_p_crop is not None:
@@ -738,7 +740,7 @@ async def inferir(imagen: UploadFile = File(...)):
 def analizar_frame_vigilancia(img: np.ndarray, rastreador: RastreadorVigilancia) -> dict:
     """Detecta múltiples vehículos por recorte, estabiliza por IoU y segmenta pasajeros."""
     t0 = time.perf_counter()
-    detecciones = _procesar_vehiculos_crop_first(img, max_vehiculos=2, imgsz_m2=416, imgsz_m3=384, imgsz_m4=320)
+    detecciones = _procesar_vehiculos_crop_first(img, max_vehiculos=2, imgsz_m2=384, imgsz_m3=320, imgsz_m4=416)
     detecciones_estables = rastreador.actualizar(detecciones)
     latencia_ms = round((time.perf_counter() - t0) * 1000, 1)
 
