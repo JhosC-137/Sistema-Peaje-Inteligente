@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:http/http.dart' as http;
 import 'package:image/image.dart' as img;
+import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import '../config.dart';
@@ -527,6 +528,88 @@ class _CasetaScreenState extends State<CasetaScreen> {
     _wsChannel = null;
   }
 
+  Future<void> _mostrarMenuVideo() async {
+    if (_procesando) return;
+    final source = await showModalBottomSheet<ImageSource>(
+      context: context,
+      backgroundColor: const Color(0xFF0F172A),
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.videocam, color: Color(0xFF38BDF8)),
+              title: const Text(
+                'Grabar clip de video',
+                style: TextStyle(color: Colors.white),
+              ),
+              onTap: () => Navigator.pop(ctx, ImageSource.camera),
+            ),
+            ListTile(
+              leading: const Icon(Icons.video_library, color: Color(0xFFA78BFA)),
+              title: const Text(
+                'Seleccionar video de galería',
+                style: TextStyle(color: Colors.white),
+              ),
+              onTap: () => Navigator.pop(ctx, ImageSource.gallery),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (source == null) return;
+    await _enviarVideo(source);
+  }
+
+  Future<void> _enviarVideo(ImageSource source) async {
+    final estabaEnVigilancia = _modoVigilanciaActivo;
+    if (estabaEnVigilancia) {
+      await _detenerVigilancia();
+    }
+
+    final picker = ImagePicker();
+    final picked = await picker.pickVideo(
+      source: source,
+      maxDuration: const Duration(seconds: 12),
+    );
+    if (picked == null) {
+      if (mounted && estabaEnVigilancia) {
+        await _toggleVigilancia(true);
+      }
+      return;
+    }
+
+    setState(() {
+      _procesando = true;
+      _errorMsg = null;
+    });
+
+    try {
+      final respuesta = await ApiService.enviarVideo(
+        casetaId: _casetaId,
+        video: File(picked.path),
+      );
+      if (!mounted) return;
+      final det = respuesta['deteccion'];
+      setState(() {
+        _ultimoResultado = respuesta;
+        if (det is Map<String, dynamic>) {
+          _deteccionActual = det;
+        }
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _errorMsg = e.toString().replaceFirst('Exception: ', '');
+      });
+    } finally {
+      if (mounted) setState(() => _procesando = false);
+      if (mounted && estabaEnVigilancia) {
+        await _toggleVigilancia(true);
+      }
+    }
+  }
+
   Future<void> _capturarYEnviar() async {
     if (!_camaraLista || _procesando || _cameraController == null) return;
 
@@ -886,24 +969,58 @@ class _CasetaScreenState extends State<CasetaScreen> {
             _buildTarjetaResultado(_ultimoResultado),
           Padding(
             padding: const EdgeInsets.all(14),
-            child: SizedBox(
-              width: double.infinity,
-              height: 54,
-              child: ElevatedButton.icon(
-                onPressed: _procesando ? null : _capturarYEnviar,
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFF10B981),
-                  foregroundColor: const Color(0xFF020617),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(14),
+            child: Row(
+              children: [
+                Expanded(
+                  flex: 3,
+                  child: SizedBox(
+                    height: 54,
+                    child: ElevatedButton.icon(
+                      onPressed: _procesando ? null : _capturarYEnviar,
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF10B981),
+                        foregroundColor: const Color(0xFF020617),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                      ),
+                      icon: const Icon(Icons.camera_alt),
+                      label: const Text(
+                        'CAPTURAR',
+                        style: TextStyle(
+                          fontWeight: FontWeight.bold,
+                          fontSize: 14,
+                        ),
+                      ),
+                    ),
                   ),
                 ),
-                icon: const Icon(Icons.camera_alt),
-                label: const Text(
-                  'CAPTURAR Y REGISTRAR PASO',
-                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+                const SizedBox(width: 10),
+                Expanded(
+                  flex: 2,
+                  child: SizedBox(
+                    height: 54,
+                    child: ElevatedButton.icon(
+                      onPressed: _procesando ? null : _mostrarMenuVideo,
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF6366F1),
+                        foregroundColor: Colors.white,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                      ),
+                      icon: const Icon(Icons.video_file),
+                      label: const Text(
+                        'VIDEO',
+                        style: TextStyle(
+                          fontWeight: FontWeight.bold,
+                          fontSize: 14,
+                        ),
+                      ),
+                    ),
+                  ),
                 ),
-              ),
+              ],
             ),
           ),
         ],

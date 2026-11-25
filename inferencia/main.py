@@ -1,6 +1,8 @@
 import re
+import os
 import time
 import base64
+import tempfile
 from collections import Counter, deque
 import cv2
 import torch
@@ -765,6 +767,159 @@ async def vigilancia_http(imagen: UploadFile = File(...)):
     if img is None:
         raise HTTPException(status_code=400, detail="Frame inválido.")
     return analizar_frame_vigilancia(img, rastreador_http)
+
+
+@app.post("/inferir-video")
+async def inferir_video(video: UploadFile = File(...)):
+    """Procesa un clip de video (MP4/MOV/3GP), muestrea frames con rastreo IoU y devuelve el mejor resultado anotado."""
+    t0 = time.perf_counter()
+    contenido = await video.read()
+    if not contenido:
+        raise HTTPException(status_code=400, detail="El archivo de video está vacío.")
+
+    suffix = Path(video.filename or "clip.mp4").suffix or ".mp4"
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(contenido)
+            tmp_path = tmp.name
+
+        cap = cv2.VideoCapture(tmp_path)
+        if not cap.isOpened():
+            raise HTTPException(status_code=400, detail="No se pudo abrir el video enviado.")
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+        max_muestras = 16
+        indices_objetivo: set[int] | None = None
+        if total_frames > max_muestras:
+            pasos = np.linspace(0, total_frames - 1, max_muestras, dtype=int)
+            indices_objetivo = set(int(i) for i in pasos)
+
+        rastreador_vid = RastreadorVigilancia()
+        mejor_score = (-1, -1.0, -1)
+        mejor_frame: np.ndarray | None = None
+        mejor_detecciones: list[dict] = []
+        mejor_principal: dict | None = None
+        frames_analizados = 0
+
+        idx_frame = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if indices_objetivo is not None:
+                if idx_frame not in indices_objetivo:
+                    idx_frame += 1
+                    continue
+            elif idx_frame % 4 != 0:
+                idx_frame += 1
+                continue
+
+            idx_frame += 1
+            frames_analizados += 1
+            detecciones = _procesar_vehiculos_crop_first(
+                frame, max_vehiculos=4, imgsz_m2=640, imgsz_m3=480, imgsz_m4=416
+            )
+            estables = rastreador_vid.actualizar(detecciones)
+
+            if mejor_frame is None:
+                mejor_frame = frame
+
+            if not estables:
+                if frames_analizados >= max_muestras:
+                    break
+                continue
+
+            cand = max(
+                estables,
+                key=lambda d: (
+                    1 if d.get("confirmado") else 0,
+                    1 if d.get("placa_detectada") and d.get("placa") != "ILEGIBLE" else 0,
+                    d.get("conf_ocr", 0.0),
+                    d.get("conf_vehiculo", 0.0),
+                ),
+            )
+            score = (
+                (2 if cand.get("confirmado") else (1 if cand.get("placa_detectada") and cand.get("placa") != "ILEGIBLE" else 0)),
+                float(cand.get("conf_ocr", 0.0)) + float(cand.get("conf_vehiculo", 0.0)),
+                int(cand.get("pasajeros", 0)),
+            )
+            if score > mejor_score:
+                mejor_score = score
+                mejor_frame = frame
+                mejor_detecciones = estables
+                mejor_principal = cand
+
+            if frames_analizados >= max_muestras:
+                break
+
+        cap.release()
+
+        if mejor_frame is None:
+            raise HTTPException(status_code=400, detail="El video no contiene fotogramas legibles.")
+
+        # Si M2 no detectó nada en todo el video, intentar M1 sobre el frame central
+        if mejor_principal is None:
+            h, w = mejor_frame.shape[:2]
+            p_leida, p_norm, conf_ocr, m1_ok, bbox_p = _detectar_placa_y_ocr_detalle(mejor_frame)
+            mejor_principal = {
+                "vehiculo_detectado": False,
+                "categoria": "auto",
+                "conf_vehiculo": 0.0,
+                "bbox_vehiculo": None,
+                "mask_vehiculo": None,
+                "placa_detectada": m1_ok,
+                "placa_leida": p_leida,
+                "placa": p_norm,
+                "conf_ocr": conf_ocr,
+                "bbox_placa": [round(bbox_p[0] / w, 4), round(bbox_p[1] / h, 4), round(bbox_p[2] / w, 4), round(bbox_p[3] / h, 4)] if m1_ok and bbox_p else None,
+                "ejes": 2,
+                "llantas": 0,
+                "llantas_puntos": [],
+                "llantas_boxes": [],
+                "keypoints_ejes": [],
+                "pasajeros": 0,
+                "mascaras_pasajeros": [],
+            }
+            mejor_detecciones = [mejor_principal]
+
+        imagen_anotada_b64 = dibujar_detecciones_multi(mejor_frame, mejor_detecciones)
+        latencia_ms = round((time.perf_counter() - t0) * 1000, 2)
+
+        return {
+            "placa_leida": mejor_principal.get("placa_leida", "ILEGIBLE"),
+            "placa_normalizada": mejor_principal.get("placa", "ILEGIBLE"),
+            "confianza_ocr": mejor_principal.get("conf_ocr", 0.0),
+            "categoria_detectada": mejor_principal.get("categoria", "auto"),
+            "ejes_detectados": mejor_principal.get("ejes", 2),
+            "pasajeros": mejor_principal.get("pasajeros", 0),
+            "latencia": latencia_ms,
+            "frames_analizados": frames_analizados,
+            "bbox_vehiculo": mejor_principal.get("bbox_vehiculo"),
+            "mask_vehiculo": mejor_principal.get("mask_vehiculo"),
+            "bbox_placa": mejor_principal.get("bbox_placa"),
+            "llantas_puntos": mejor_principal.get("llantas_puntos", []),
+            "llantas_boxes": mejor_principal.get("llantas_boxes", []),
+            "keypoints_ejes": mejor_principal.get("keypoints_ejes", []),
+            "mascaras_pasajeros": mejor_principal.get("mascaras_pasajeros", []),
+            "detecciones": mejor_detecciones,
+            "imagen_anotada_b64": imagen_anotada_b64,
+            "detalles": {
+                "device": DEVICE,
+                "frames_analizados": frames_analizados,
+                "m1_placa_detectada": mejor_principal.get("placa_detectada", False),
+                "m2_confianza": mejor_principal.get("conf_vehiculo", 0.0),
+                "m3_llantas_detectadas": mejor_principal.get("llantas", 0),
+                "pasajeros_segmentados": mejor_principal.get("pasajeros", 0),
+                "latencia_ms": latencia_ms,
+            },
+        }
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 @app.websocket("/ws/vigilancia")

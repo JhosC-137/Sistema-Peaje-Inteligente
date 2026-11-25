@@ -18,7 +18,8 @@ class PeajeController extends Controller
     {
         $request->validate([
             'caseta_id' => 'required|exists:casetas,id',
-            'imagen' => 'nullable|image|max:5120',
+            'imagen' => 'nullable|image|max:10240',
+            'video' => 'nullable|file|mimetypes:video/mp4,video/quicktime,video/x-msvideo,video/webm,video/3gpp,application/octet-stream|max:51200',
         ]);
 
         $imagenUrl = null;
@@ -31,9 +32,29 @@ class PeajeController extends Controller
             $imagenUrl = asset('storage/' . $path);
         }
 
-        // 1. Llamar al servidor de inferencia (o usar datos simulados si aún no está activo)
+        // 1. Llamar al servidor de inferencia (video o imagen) o usar datos simulados
         $inferenceUrl = config('services.inference_url') ?? env('INFERENCE_URL');
-        if (!empty($inferenceUrl) && $request->hasFile('imagen')) {
+        if (!empty($inferenceUrl) && $request->hasFile('video')) {
+            $videoFile = $request->file('video');
+            $response = Http::timeout(90)
+                ->attach('video', file_get_contents($videoFile->getRealPath()), $videoFile->getClientOriginalName() ?: 'clip.mp4')
+                ->post(rtrim($inferenceUrl, '/') . '/inferir-video');
+
+            if (!$response->ok()) {
+                return response()->json(['error' => 'Fallo al procesar el video en el motor IA'], 502);
+            }
+            $ia = $response->json();
+
+            if (!empty($ia['imagen_anotada_b64'])) {
+                $binario = base64_decode($ia['imagen_anotada_b64'], true);
+                if ($binario !== false) {
+                    $imagenBase64 = $ia['imagen_anotada_b64'];
+                    $nombreArchivo = 'evidencias/vid_' . uniqid() . '.jpg';
+                    Storage::disk('public')->put($nombreArchivo, $binario);
+                    $imagenUrl = asset('storage/' . $nombreArchivo);
+                }
+            }
+        } elseif (!empty($inferenceUrl) && $request->hasFile('imagen')) {
             $response = Http::timeout(30)
                 ->attach('imagen', file_get_contents($request->file('imagen')->getRealPath()), 'frame.jpg')
                 ->post(rtrim($inferenceUrl, '/') . '/inferir');

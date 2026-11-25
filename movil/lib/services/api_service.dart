@@ -50,9 +50,22 @@ class ApiService {
     return _enviarMultipart(casetaId: casetaId, archivo: file);
   }
 
+  static Future<dynamic> enviarVideo({
+    required int casetaId,
+    required File video,
+  }) async {
+    final file = await http.MultipartFile.fromPath('video', video.path);
+    return _enviarMultipart(
+      casetaId: casetaId,
+      archivo: file,
+      timeoutSeconds: 120,
+    );
+  }
+
   static Future<dynamic> _enviarMultipart({
     required int casetaId,
     required http.MultipartFile archivo,
+    int timeoutSeconds = 65,
   }) async {
     final prefs = await SharedPreferences.getInstance();
     final token = prefs.getString('auth_token');
@@ -69,7 +82,9 @@ class ApiService {
     request.fields['caseta_id'] = casetaId.toString();
     request.files.add(archivo);
 
-    final streamed = await request.send().timeout(const Duration(seconds: 65));
+    final streamed = await request.send().timeout(
+      Duration(seconds: timeoutSeconds),
+    );
     final body = await streamed.stream.bytesToString();
     final data = jsonDecode(body);
 
