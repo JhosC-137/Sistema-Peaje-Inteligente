@@ -91,7 +91,7 @@ class VigilanciaPainter extends CustomPainter {
       );
     }
 
-    // 3. Cajas y puntos de llantas / ejes (M3)
+    // 3. Cajas, línea conectora y keypoints de ejes/llantas (M3)
     final llantasBoxes = det['llantas_boxes'];
     if (llantasBoxes is List) {
       final paintLlantaBox = Paint()
@@ -112,28 +112,59 @@ class VigilanciaPainter extends CustomPainter {
             canvas,
             size,
             Offset(rectL.left, rectL.top - 16),
-            'L${i + 1}',
+            'E${i + 1}',
             const Color(0xFFFF9100),
           );
         }
       }
     }
 
-    final llantas = det['llantas_puntos'];
-    if (llantas is List) {
-      final fillLlanta = Paint()..color = const Color(0xFFFF9100);
-      final bordeLlanta = Paint()
-        ..color = Colors.white
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 1.5;
-      for (final pt in llantas) {
-        if (pt is List && pt.length >= 2) {
-          final center = Offset(
-            (pt[0] as num).toDouble() * size.width,
-            (pt[1] as num).toDouble() * size.height,
-          );
-          canvas.drawCircle(center, 5, fillLlanta);
-          canvas.drawCircle(center, 6.5, bordeLlanta);
+    final kpts = det['keypoints_ejes'];
+    if (kpts is List && kpts.isNotEmpty) {
+      final linePaint = Paint()
+        ..color = const Color(0xFFFF9100)
+        ..strokeWidth = 3.0
+        ..style = PaintingStyle.stroke;
+      final dotFill = Paint()..color = const Color(0xFFFFEA00);
+      final dotBorder = Paint()
+        ..color = Colors.black
+        ..strokeWidth = 1.5
+        ..style = PaintingStyle.stroke;
+
+      final offsets = kpts
+          .whereType<Map>()
+          .map<Offset>(
+            (k) => Offset(
+              (k['x'] as num).toDouble() * size.width,
+              (k['y'] as num).toDouble() * size.height,
+            ),
+          )
+          .toList();
+
+      for (int i = 0; i < offsets.length - 1; i++) {
+        canvas.drawLine(offsets[i], offsets[i + 1], linePaint);
+      }
+      for (final off in offsets) {
+        canvas.drawCircle(off, 6.0, dotFill);
+        canvas.drawCircle(off, 6.0, dotBorder);
+      }
+    } else {
+      final llantas = det['llantas_puntos'];
+      if (llantas is List) {
+        final fillLlanta = Paint()..color = const Color(0xFFFFEA00);
+        final bordeLlanta = Paint()
+          ..color = Colors.black
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.5;
+        for (final pt in llantas) {
+          if (pt is List && pt.length >= 2) {
+            final center = Offset(
+              (pt[0] as num).toDouble() * size.width,
+              (pt[1] as num).toDouble() * size.height,
+            );
+            canvas.drawCircle(center, 5.5, fillLlanta);
+            canvas.drawCircle(center, 5.5, bordeLlanta);
+          }
         }
       }
     }

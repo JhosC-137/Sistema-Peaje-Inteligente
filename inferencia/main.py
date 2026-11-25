@@ -31,7 +31,8 @@ M1_OCR_PATH = WEIGHTS_DIR / "cct_xs_v2_global.onnx"
 M1_CFG_PATH = WEIGHTS_DIR / "cct_xs_v2_global_plate_config.yaml"
 M2_PATH = WEIGHTS_DIR / "m2_vehiculos.pt"
 M3_PATH = WEIGHTS_DIR / "m3_ejes.pt"
-M4_PATH = WEIGHTS_DIR / "m4_pasajeros.pt"
+M4_PATH = WEIGHTS_DIR / "m4_pasajeros_seg.pt"
+M4_ALT_PATH = WEIGHTS_DIR / "m4_pasajeros.pt"
 YOLO_SEG_FALLBACK = BASE_DIR / "yolo11n-seg.pt"
 
 # Inicializar M1 Detector ONNX + OCR especializado
@@ -46,14 +47,11 @@ ocr_placas = (
     else None
 )
 
-# Inicializar M2 (vehículos), M3 (ejes) y M4 (pasajeros segmentados)
+# Inicializar M2 (vehículos), M3 (ejes) y M4 (solo si existe modelo entrenado de pasajeros)
 modelo_m2 = YOLO(str(M2_PATH)) if M2_PATH.exists() else YOLO(str(YOLO_SEG_FALLBACK) if YOLO_SEG_FALLBACK.exists() else "yolo11n-seg.pt")
 modelo_m3 = YOLO(str(M3_PATH)) if M3_PATH.exists() else None
-modelo_pasajeros = (
-    YOLO(str(M4_PATH))
-    if M4_PATH.exists()
-    else YOLO(str(YOLO_SEG_FALLBACK) if YOLO_SEG_FALLBACK.exists() else "yolo11n-seg.pt")
-)
+_m4_peso = M4_PATH if M4_PATH.exists() else (M4_ALT_PATH if M4_ALT_PATH.exists() else None)
+modelo_pasajeros = YOLO(str(_m4_peso)) if _m4_peso is not None else None
 USE_HALF = DEVICE.startswith("cuda")
 
 # Warmup inicial para evitar latencia alta en la primera petición
@@ -63,7 +61,7 @@ try:
     if modelo_m3 is not None:
         modelo_m3.predict(_dummy, imgsz=384, conf=0.25, device=DEVICE, half=USE_HALF, verbose=False)
     if modelo_pasajeros is not None:
-        modelo_pasajeros.predict(_dummy, imgsz=384, conf=0.30, classes=[0], device=DEVICE, half=USE_HALF, verbose=False)
+        modelo_pasajeros.predict(_dummy, imgsz=384, conf=0.30, device=DEVICE, half=USE_HALF, verbose=False)
 except Exception:
     pass
 
@@ -235,20 +233,21 @@ def _contenida(a: list[float], b: list[float]) -> float:
 
 def contar_ejes_en_recorte(
     crop_v: np.ndarray, categoria: str, imgsz: int = 416
-) -> tuple[int, int, list[list[float]], list[list[float]]]:
+) -> tuple[int, int, list[list[float]], list[list[float]], list[dict]]:
     """Etapa 3: Cuenta ejes sobre el recorte del vehículo usando M3 (keypoints/cajas de llantas)."""
     ch, cw = crop_v.shape[:2]
     if ch < 30 or cw < 30 or modelo_m3 is None:
-        return (3 if categoria in ("bus", "camion") else 2), 0, [], []
+        return (3 if categoria in ("bus", "camion") else 2), 0, [], [], []
 
     res_m3 = modelo_m3.predict(
         crop_v, imgsz=imgsz, conf=0.25, iou=0.45, device=DEVICE, half=USE_HALF, verbose=False
     )[0]
     if res_m3.boxes is None or len(res_m3.boxes) == 0:
-        return (3 if categoria in ("bus", "camion") else 2), 0, [], []
+        return (3 if categoria in ("bus", "camion") else 2), 0, [], [], []
 
     cajas = res_m3.boxes.xyxy.cpu().numpy()
-    kpts_xy = res_m3.keypoints.xy.cpu().numpy() if res_m3.keypoints is not None else None
+    kpts_xy = res_m3.keypoints.xy.cpu().numpy() if getattr(res_m3, "keypoints", None) is not None and res_m3.keypoints is not None else None
+    kpts_conf = res_m3.keypoints.conf.cpu().numpy() if kpts_xy is not None and res_m3.keypoints.conf is not None else None
 
     # 1. Descartar detecciones internas (aros dentro de llanta)
     orden = np.argsort(-((cajas[:, 2] - cajas[:, 0]) * (cajas[:, 3] - cajas[:, 1])))
@@ -257,7 +256,8 @@ def contar_ejes_en_recorte(
         box = cajas[idx].tolist()
         if all(_contenida(box, r["box"]) < UMBRAL_CONTENCION for r in llantas):
             kps = kpts_xy[idx] if kpts_xy is not None else None
-            llantas.append({"box": box, "kps": kps})
+            kconf = float(kpts_conf[idx][0]) if kpts_conf is not None else float(res_m3.boxes.conf[idx].item())
+            llantas.append({"box": box, "kps": kps, "conf": kconf})
 
     # 2. Filtrar solo llantas en la parte inferior del vehículo (ignorar espejos/luces)
     asociadas = []
@@ -270,30 +270,36 @@ def contar_ejes_en_recorte(
             l["cy"] = cy
             l["vis_h"] = (
                 max(1.0, float(l["kps"][1, 1] - l["kps"][2, 1]))
-                if l["kps"] is not None and l["kps"][1, 1] > l["kps"][2, 1]
+                if l["kps"] is not None and len(l["kps"]) >= 3 and l["kps"][1, 1] > l["kps"][2, 1]
                 else max(1.0, by2 - by1)
             )
             asociadas.append(l)
 
     if not asociadas:
-        return (3 if categoria in ("bus", "camion") else 2), 0, [], []
+        return (3 if categoria in ("bus", "camion") else 2), 0, [], [], []
 
     # 3. Filtrar lado cercano usando altura visible
     hmax = max(l["vis_h"] for l in asociadas)
     cercanas = [l for l in asociadas if l["vis_h"] >= UMBRAL_CERCANA * hmax]
     cercanas.sort(key=lambda l: l["cx"])
 
-    # 4. Agrupar llantas gemelas por separación horizontal
-    xs = [l["cx"] for l in cercanas]
+    # 4. Agrupar llantas gemelas por separación horizontal y conservar 1 keypoint por eje
     diam = float(np.median([l["vis_h"] for l in cercanas]))
     umbral_sep = max(cw * 0.08, SEPARACION_EJE * diam)
-    ejes = 1 + sum(1 for p, q in zip(xs, xs[1:]) if (q - p) > umbral_sep)
+    ejes_unicos = [cercanas[0]]
+    for l in cercanas[1:]:
+        if abs(l["cx"] - ejes_unicos[-1]["cx"]) > umbral_sep:
+            ejes_unicos.append(l)
 
-    ejes = max(2, min(6, ejes))
+    ejes = max(2, min(6, len(ejes_unicos)))
     if categoria in ("moto", "auto", "minibus") and ejes > 2:
         ejes = 2
 
     puntos_rel = [[round(l["cx"] / cw, 4), round(l["cy"] / ch, 4)] for l in cercanas]
+    keypoints_ejes_rel = [
+        {"x": round(l["cx"] / cw, 4), "y": round(l["cy"] / ch, 4), "conf": round(l["conf"], 3)}
+        for l in ejes_unicos
+    ]
     boxes_rel = [
         [
             round(max(0.0, l["box"][0]) / cw, 4),
@@ -303,19 +309,19 @@ def contar_ejes_en_recorte(
         ]
         for l in cercanas
     ]
-    return ejes, len(cercanas), puntos_rel, boxes_rel
+    return ejes, len(cercanas), puntos_rel, boxes_rel, keypoints_ejes_rel
 
 
 def segmentar_pasajeros_en_recorte(
     crop_v: np.ndarray, imgsz: int = 320
 ) -> tuple[int, list[list[list[float]]]]:
-    """Etapa 4: Segmenta y cuenta pasajeros visibles dentro de la cabina del vehículo (sin rostros)."""
+    """Etapa 4: Segmenta y cuenta pasajeros visibles dentro de la cabina (55% superior, sin rostros)."""
     ch, cw = crop_v.shape[:2]
     if ch < 40 or cw < 40 or modelo_pasajeros is None:
         return 0, []
 
     res_p = modelo_pasajeros.predict(
-        crop_v, imgsz=imgsz, conf=0.30, classes=[0], device=DEVICE, half=USE_HALF, verbose=False
+        crop_v, imgsz=imgsz, conf=0.35, device=DEVICE, half=USE_HALF, verbose=False
     )[0]
     if res_p.boxes is None or len(res_p.boxes) == 0:
         return 0, []
@@ -328,8 +334,8 @@ def segmentar_pasajeros_en_recorte(
         px1, py1, px2, py2 = box.tolist()
         cy = (py1 + py2) / 2.0
         area_rel = ((px2 - px1) * (py2 - py1)) / max(1.0, cw * ch)
-        # Filtrar personas visibles en zona de cabina/parabrisas y evitar ruido diminuto
-        if cy > ch * 0.80 or area_rel < 0.002:
+        # Filtrar exclusivamente el 58% superior del vehículo (zona de parabrisas/ventanas)
+        if cy > ch * 0.58 or area_rel < 0.003:
             continue
 
         if masks_xyn is not None and i < len(masks_xyn) and len(masks_xyn[i]) >= 3:
@@ -460,7 +466,9 @@ def _procesar_vehiculos_crop_first(
             cw = max(1, cx2 - cx1)
             ch = max(1, cy2 - cy1)
 
-            ejes, llantas_det, pts_rel, lboxes_rel = contar_ejes_en_recorte(crop_v, categoria, imgsz=imgsz_m3)
+            ejes, llantas_det, pts_rel, lboxes_rel, kpts_ejes_rel = contar_ejes_en_recorte(
+                crop_v, categoria, imgsz=imgsz_m3
+            )
             placa_leida, placa_norm, conf_ocr, m1_ok, bbox_p_crop = _detectar_placa_y_ocr_detalle(crop_v)
             pasajeros, mascaras_pas_rel = segmentar_pasajeros_en_recorte(crop_v, imgsz=imgsz_m4)
 
@@ -477,6 +485,14 @@ def _procesar_vehiculos_crop_first(
             llantas_puntos = [
                 [round((cx1 + pt[0] * cw) / w, 4), round((cy1 + pt[1] * ch) / h, 4)]
                 for pt in pts_rel
+            ]
+            keypoints_ejes = [
+                {
+                    "x": round((cx1 + k["x"] * cw) / w, 4),
+                    "y": round((cy1 + k["y"] * ch) / h, 4),
+                    "conf": k["conf"],
+                }
+                for k in kpts_ejes_rel
             ]
             llantas_boxes = [
                 [
@@ -506,6 +522,7 @@ def _procesar_vehiculos_crop_first(
                 "llantas": llantas_det,
                 "llantas_puntos": llantas_puntos,
                 "llantas_boxes": llantas_boxes,
+                "keypoints_ejes": keypoints_ejes,
                 "pasajeros": pasajeros,
                 "mascaras_pasajeros": mascaras_pasajeros,
             })
@@ -542,16 +559,26 @@ def dibujar_detecciones_multi(img: np.ndarray, detecciones: list[dict]) -> str:
             cv2.rectangle(canvas, (vx1, ty - th - 8), (vx1 + tw + 10, ty), color_v, -1)
             cv2.putText(canvas, etiqueta_v, (vx1 + 5, ty - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 0, 0), 2)
 
-        # 3. Cajas y keypoints de llantas / ejes (naranja)
+        # 3. Cajas, keypoints y línea conectora de ejes (naranja/amarillo)
         for idx_l, lbox in enumerate(det.get("llantas_boxes", []), start=1):
             lx1, ly1, lx2, ly2 = int(lbox[0] * w), int(lbox[1] * h), int(lbox[2] * w), int(lbox[3] * h)
             cv2.rectangle(canvas, (lx1, ly1), (lx2, ly2), (0, 145, 255), 2)
-            cv2.putText(canvas, f"L{idx_l}", (lx1, max(14, ly1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 145, 255), 2)
+            cv2.putText(canvas, f"E{idx_l}", (lx1, max(14, ly1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 145, 255), 2)
 
-        for lx, ly in det.get("llantas_puntos", []):
-            cx, cy = int(lx * w), int(ly * h)
-            cv2.circle(canvas, (cx, cy), 5, (0, 165, 255), -1)
-            cv2.circle(canvas, (cx, cy), 7, (255, 255, 255), 1)
+        kpts_ejes = det.get("keypoints_ejes", [])
+        if len(kpts_ejes) >= 2:
+            for a, b in zip(kpts_ejes, kpts_ejes[1:]):
+                cv2.line(
+                    canvas,
+                    (int(a["x"] * w), int(a["y"] * h)),
+                    (int(b["x"] * w), int(b["y"] * h)),
+                    (0, 145, 255),
+                    3,
+                )
+        for k in kpts_ejes:
+            cx, cy = int(k["x"] * w), int(k["y"] * h)
+            cv2.circle(canvas, (cx, cy), 6, (0, 234, 255), -1)
+            cv2.circle(canvas, (cx, cy), 7, (0, 0, 0), 2)
 
         # 4. Caja de la placa + caracteres leídos (amarillo)
         bp = det.get("bbox_placa")
@@ -640,6 +667,7 @@ async def inferir(imagen: UploadFile = File(...)):
                 "llantas": 0,
                 "llantas_puntos": [],
                 "llantas_boxes": [],
+                "keypoints_ejes": [],
                 "pasajeros": 0,
                 "mascaras_pasajeros": [],
             }]
@@ -666,6 +694,7 @@ async def inferir(imagen: UploadFile = File(...)):
         "bbox_placa": principal["bbox_placa"],
         "llantas_puntos": principal["llantas_puntos"],
         "llantas_boxes": principal["llantas_boxes"],
+        "keypoints_ejes": principal.get("keypoints_ejes", []),
         "mascaras_pasajeros": principal["mascaras_pasajeros"],
         "detecciones": detecciones,
         "imagen_anotada_b64": imagen_anotada_b64,

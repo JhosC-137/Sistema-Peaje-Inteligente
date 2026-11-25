@@ -137,7 +137,7 @@ Uint8List _convertirFrameAJpeg(_RawFrame frame) {
     orientada = img.copyResize(orientada, width: 640);
   }
 
-  return Uint8List.fromList(img.encodeJpg(orientada, quality: 72));
+  return Uint8List.fromList(img.encodeJpg(orientada, quality: 65));
 }
 
 class CasetaScreen extends StatefulWidget {
@@ -432,11 +432,13 @@ class _CasetaScreenState extends State<CasetaScreen> {
 
       for (final item in lista) {
         if (item is! Map) continue;
-        final confirmado = item['confirmado'] == true ||
-            (item['placa_detectada'] == true &&
-                ((item['conf_ocr'] as num?)?.toDouble() ?? 0.0) >= 0.75);
-        final placa = (item['placa'] ?? '').toString().trim();
-        if (confirmado && placa.isNotEmpty && placa != 'ILEGIBLE') {
+        final placa = (item['placa'] ?? '').toString().trim().toUpperCase();
+        final confOcr = (item['conf_ocr'] as num?)?.toDouble() ?? 0.0;
+        final bool placaValida = placa.length >= 5 &&
+            placa != 'ILEGIBLE' &&
+            RegExp(r'^[A-Z0-9-]+$').hasMatch(placa) &&
+            confOcr >= 0.72;
+        if (item['confirmado'] == true && placaValida) {
           final ahora = DateTime.now();
           final ultimo = _ultimosRegistros[placa];
           if ((ultimo == null || ahora.difference(ultimo).inSeconds >= 30) &&
