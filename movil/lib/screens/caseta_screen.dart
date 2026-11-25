@@ -53,7 +53,10 @@ Uint8List _convertirFrameAJpeg(_RawFrame frame) {
       order: img.ChannelOrder.bgra,
     );
   } else if (frame.planes.length >= 3) {
-    decoded = img.Image(width: frame.width, height: frame.height);
+    final step = frame.width > 640 ? 2 : 1;
+    final outW = (frame.width + step - 1) ~/ step;
+    final outH = (frame.height + step - 1) ~/ step;
+    decoded = img.Image(width: outW, height: outH);
     final yPlane = frame.planes[0];
     final uPlane = frame.planes[1];
     final vPlane = frame.planes[2];
@@ -63,11 +66,11 @@ Uint8List _convertirFrameAJpeg(_RawFrame frame) {
     final uPixelStride = frame.bytesPerPixel[1];
     final vPixelStride = frame.bytesPerPixel[2];
 
-    for (int y = 0; y < frame.height; y++) {
+    for (int dy = 0, y = 0; y < frame.height; dy++, y += step) {
       final yRow = y * yStride;
       final uRow = (y >> 1) * uStride;
       final vRow = (y >> 1) * vStride;
-      for (int x = 0; x < frame.width; x++) {
+      for (int dx = 0, x = 0; x < frame.width; dx++, x += step) {
         final yIdx = yRow + x;
         final uIdx = uRow + (x >> 1) * uPixelStride;
         final vIdx = vRow + (x >> 1) * vPixelStride;
@@ -80,8 +83,8 @@ Uint8List _convertirFrameAJpeg(_RawFrame frame) {
         int b = (yVal + 1.732446 * uVal).round();
 
         decoded.setPixelRgb(
-          x,
-          y,
+          dx,
+          dy,
           r.clamp(0, 255),
           g.clamp(0, 255),
           b.clamp(0, 255),
@@ -739,8 +742,15 @@ class _CasetaScreenState extends State<CasetaScreen> {
                           children: [
                             CameraPreview(_cameraController!),
                             if (_deteccionActual != null)
-                              CustomPaint(
-                                painter: VigilanciaPainter(_deteccionActual),
+                              Positioned.fill(
+                                child: IgnorePointer(
+                                  child: CustomPaint(
+                                    size: Size.infinite,
+                                    painter: VigilanciaPainter(
+                                      _deteccionActual,
+                                    ),
+                                  ),
+                                ),
                               ),
                           ],
                         ),

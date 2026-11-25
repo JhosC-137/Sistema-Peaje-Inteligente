@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Models\Alerta;
 use App\Models\Paso;
+use App\Models\Tarifa;
 use App\Models\Vehiculo;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
@@ -23,48 +24,59 @@ class AgenteController extends Controller
             ]);
         }
 
-        $preguntaLower = mb_strtolower($pregunta);
-
-        // 1. Detectar si consulta una placa específica (soporta guiones o espacios, ej. 1234-ABC)
-        if (preg_match('/\b([0-9]{3,4}[-\s]?[a-z]{2,3})\b/i', $pregunta, $match)) {
-            $placaBuscada = $this->normalizarPlaca($match[1]);
+        // 1. Detectar si consulta una placa (ej. 1234ABC, NN4225, ABC123, 1234-ABC)
+        $placaBuscada = $this->extraerPlacaDeTexto($pregunta);
+        if ($placaBuscada !== null) {
             $analisis = $this->analizarPlaca($placaBuscada);
+            $respuestaQwen = $this->consultarQwen($pregunta, $analisis);
+            if ($respuestaQwen !== null) {
+                $analisis['respuesta'] = $respuestaQwen;
+            }
             return response()->json($analisis);
         }
 
-        // 2. Consultas de recaudación / ingresos
+        // 2. Contexto real de BD para Qwen o respuesta determinista
+        $contextoBd = $this->obtenerResumenBd();
+        $respuestaQwen = $this->consultarQwen($pregunta, $contextoBd);
+        if ($respuestaQwen !== null) {
+            return response()->json(['respuesta' => $respuestaQwen]);
+        }
+
+        $preguntaLower = mb_strtolower($pregunta);
+
+        // Consultas de recaudación / ingresos
         if (str_contains($preguntaLower, 'recaud') || str_contains($preguntaLower, 'dinero') || str_contains($preguntaLower, 'monto') || str_contains($preguntaLower, 'ingreso')) {
-            $hoy = Paso::whereDate('created_at', today())->where('estado', 'autorizado')->sum('monto');
-            $total = Paso::where('estado', 'autorizado')->sum('monto');
+            $hoy = number_format($contextoBd['recaudacion_hoy'], 2);
+            $total = number_format($contextoBd['recaudacion_historica'], 2);
             return response()->json([
-                'respuesta' => "💰 **Recaudación:** Hoy se han recaudado **Bs. " . number_format($hoy, 2) . "** en pasos autorizados (Total histórico: **Bs. " . number_format($total, 2) . "**).",
+                'respuesta' => "💰 **Recaudación:** Hoy se han recaudado **Bs. {$hoy}** en pasos autorizados (Total histórico: **Bs. {$total}**).",
             ]);
         }
 
-        // 3. Consultas de alertas / sin saldo / no registradas
+        // Consultas de alertas / sin saldo / no registradas
         if (str_contains($preguntaLower, 'alerta') || str_contains($preguntaLower, 'saldo') || str_contains($preguntaLower, 'rechaz') || str_contains($preguntaLower, 'registrad')) {
-            $pendientes = Alerta::with('paso')->where('atendida', false)->latest()->take(5)->get();
-            if ($pendientes->isEmpty()) {
+            $pendientes = $contextoBd['alertas_pendientes'];
+            if (empty($pendientes)) {
                 return response()->json(['respuesta' => '✅ No hay alertas pendientes de atención en este momento.']);
             }
-            $lista = $pendientes->map(fn($a) => "• Placa **" . ($a->paso->placa_normalizada ?? 'ILEGIBLE') . "** ({$a->tipo})")->implode("\n");
+            $lista = collect($pendientes)->map(fn($a) => "• Placa **{$a['placa']}** ({$a['tipo']})")->implode("\n");
             return response()->json([
-                'respuesta' => "🚨 Hay **{$pendientes->count()} alertas activas**:\n{$lista}",
+                'respuesta' => "🚨 Hay **" . count($pendientes) . " alertas activas**:\n{$lista}",
             ]);
         }
 
-        // 4. Consultas de conteo de vehículos / tráfico
-        if (str_contains($preguntaLower, 'cuanto') || str_contains($preguntaLower, 'cuánto') || str_contains($preguntaLower, 'paso') || str_contains($preguntaLower, 'vehiculo') || str_contains($preguntaLower, 'vehículo') || str_contains($preguntaLower, 'trafico')) {
-            $totalHoy = Paso::whereDate('created_at', today())->count();
-            $porCat = Paso::selectRaw('categoria_detectada, count(*) as total')->groupBy('categoria_detectada')->pluck('total', 'categoria_detectada');
-            $desglose = $porCat->isEmpty() ? 'Sin registros aún.' : $porCat->map(fn($c, $k) => "{$k}: {$c}")->implode(', ');
+        // Consultas de conteo de vehículos / tráfico / resumen
+        if (str_contains($preguntaLower, 'cuanto') || str_contains($preguntaLower, 'cuánto') || str_contains($preguntaLower, 'paso') || str_contains($preguntaLower, 'vehiculo') || str_contains($preguntaLower, 'vehículo') || str_contains($preguntaLower, 'trafico') || str_contains($preguntaLower, 'resumen') || str_contains($preguntaLower, 'tarifa')) {
+            $desglose = empty($contextoBd['pasos_por_categoria'])
+                ? 'Sin registros aún.'
+                : collect($contextoBd['pasos_por_categoria'])->map(fn($c, $k) => "{$k}: {$c}")->implode(', ');
             return response()->json([
-                'respuesta' => "🚗 **Tráfico:** Hoy se registraron **{$totalHoy} pasos**. Desglose histórico por categoría: {$desglose}.",
+                'respuesta' => "🚗 **Tráfico:** Hoy se registraron **{$contextoBd['pasos_hoy']} pasos**. Padrón: **{$contextoBd['total_vehiculos']} vehículos**. Por categoría: {$desglose}.",
             ]);
         }
 
         return response()->json([
-            'respuesta' => "Puedo ayudarte con consultas como:\n• *¿Cuál es el estado de la placa 1234ABC?*\n• *Subir la foto de una placa*\n• *¿Cuánto se recaudó hoy?*\n• *¿Qué alertas pendientes hay?*",
+            'respuesta' => "Puedo ayudarte con consultas como:\n• *¿Cuál es el estado de la placa 1234ABC?*\n• *Estado de la placa NN4225*\n• *Subir la foto de una placa*\n• *¿Cuánto se recaudó hoy?*\n• *¿Qué alertas pendientes hay?*",
         ]);
     }
 
@@ -153,9 +165,88 @@ class AgenteController extends Controller
         return response()->json($analisis);
     }
 
+    private function extraerPlacaDeTexto(string $texto): ?string
+    {
+        if (!preg_match_all('/\b([A-Z0-9]{2,5}[-\s]?[A-Z0-9]{2,5})\b/i', $texto, $matches)) {
+            return null;
+        }
+        foreach ($matches[1] as $candidato) {
+            $norm = $this->normalizarPlaca($candidato);
+            if (strlen($norm) >= 5 && strlen($norm) <= 9 && preg_match('/[A-Z]/', $norm) && preg_match('/\d{2,}/', $norm)) {
+                return $norm;
+            }
+        }
+        return null;
+    }
+
     private function normalizarPlaca(string $texto): string
     {
         return preg_replace('/[^A-Z0-9]/', '', strtoupper(trim($texto))) ?? '';
+    }
+
+    private function obtenerResumenBd(): array
+    {
+        $pendientes = Alerta::with('paso')->where('atendida', false)->latest()->take(5)->get();
+        return [
+            'pasos_hoy' => Paso::whereDate('created_at', today())->count(),
+            'recaudacion_hoy' => (float) Paso::whereDate('created_at', today())->where('estado', 'autorizado')->sum('monto'),
+            'recaudacion_historica' => (float) Paso::where('estado', 'autorizado')->sum('monto'),
+            'total_vehiculos' => Vehiculo::count(),
+            'pasos_por_categoria' => Paso::selectRaw('categoria_detectada, count(*) as total')->groupBy('categoria_detectada')->pluck('total', 'categoria_detectada')->toArray(),
+            'tarifas' => Tarifa::all(['categoria', 'ejes', 'monto'])->toArray(),
+            'alertas_pendientes' => $pendientes->map(fn($a) => [
+                'placa' => $a->paso->placa_normalizada ?? 'ILEGIBLE',
+                'tipo' => $a->tipo,
+                'hora' => $a->created_at->format('d/m H:i'),
+            ])->toArray(),
+        ];
+    }
+
+    private function consultarQwen(string $pregunta, array $contextoBd): ?string
+    {
+        $qwenUrl = config('services.qwen.url');
+        $qwenKey = config('services.qwen.key');
+        $qwenModel = config('services.qwen.model', 'Qwen/Qwen2.5-7B-Instruct');
+
+        if (empty($qwenKey) && !str_contains((string) $qwenUrl, 'trycloudflare.com') && !str_contains((string) $qwenUrl, 'runpod')) {
+            return null;
+        }
+        if (empty($qwenUrl)) {
+            return null;
+        }
+
+        try {
+            $req = Http::timeout(12);
+            if (!empty($qwenKey)) {
+                $req = $req->withToken($qwenKey);
+            }
+            $res = $req->post($qwenUrl, [
+                'model' => $qwenModel,
+                'temperature' => 0.1,
+                'max_tokens' => 320,
+                'messages' => [
+                    [
+                        'role' => 'system',
+                        'content' => 'Eres el Agente del Sistema Inteligente de Control de Peaje. Responde en español de forma clara y directa usando EXCLUSIVAMENTE los datos reales de PostgreSQL provistos en el JSON de contexto. Nunca inventes placas, fechas, montos ni registros. Si hay sugerencias de OCR, menciónalas.',
+                    ],
+                    [
+                        'role' => 'user',
+                        'content' => "Pregunta del usuario: {$pregunta}\n\nDatos reales de la base de datos:\n" . json_encode($contextoBd, JSON_UNESCAPED_UNICODE),
+                    ],
+                ],
+            ]);
+
+            if ($res->ok()) {
+                $contenido = $res->json('choices.0.message.content');
+                if (is_string($contenido) && trim($contenido) !== '') {
+                    return trim($contenido);
+                }
+            }
+        } catch (\Throwable $e) {
+            return null;
+        }
+
+        return null;
     }
 
     private function analizarPlaca(string $placa): array

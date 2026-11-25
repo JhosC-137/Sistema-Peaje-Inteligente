@@ -10,6 +10,8 @@ Route::get('/', [AuthController::class, 'showLogin'])->name('login');
 Route::get('/auth/google/redirect', [AuthController::class, 'redirectToGoogle'])->name('google.redirect');
 Route::get('/auth/google/callback', [AuthController::class, 'handleGoogleCallback'])->name('google.callback');
 Route::post('/logout', [AuthController::class, 'logout'])->name('logout');
+Route::get('/evidencias/{paso}', [PeajeController::class, 'verEvidencia'])->name('evidencias.ver');
+Route::get('/storage/evidencias/{archivo}', [PeajeController::class, 'verArchivoStorage']);
 
 Route::middleware('auth')->group(function () {
     Route::get('/dashboard', [DashboardController::class, 'index'])->name('dashboard');

@@ -22,8 +22,11 @@ class PeajeController extends Controller
         ]);
 
         $imagenUrl = null;
+        $imagenBase64 = null;
         $path = null;
         if ($request->hasFile('imagen')) {
+            $rawBytes = file_get_contents($request->file('imagen')->getRealPath());
+            $imagenBase64 = base64_encode($rawBytes);
             $path = $request->file('imagen')->store('evidencias', 'public');
             $imagenUrl = asset('storage/' . $path);
         }
@@ -40,10 +43,13 @@ class PeajeController extends Controller
             }
             $ia = $response->json();
 
-            if ($path && !empty($ia['imagen_anotada_b64'])) {
+            if (!empty($ia['imagen_anotada_b64'])) {
                 $binario = base64_decode($ia['imagen_anotada_b64'], true);
                 if ($binario !== false) {
-                    Storage::disk('public')->put($path, $binario);
+                    $imagenBase64 = $ia['imagen_anotada_b64'];
+                    if ($path) {
+                        Storage::disk('public')->put($path, $binario);
+                    }
                 }
             }
         } else {
@@ -100,8 +106,13 @@ class PeajeController extends Controller
             'caseta_id' => $request->caseta_id,
             'usuario_id' => $request->user()->id,
             'imagen_url' => $imagenUrl,
+            'imagen_base64' => $imagenBase64,
             'estado' => $estado,
         ]);
+
+        if ($imagenBase64 !== null) {
+            $paso->update(['imagen_url' => url("/evidencias/{$paso->id}")]);
+        }
 
         if ($tipoAlerta) {
             Alerta::create(['paso_id' => $paso->id, 'tipo' => $tipoAlerta]);
@@ -142,5 +153,33 @@ class PeajeController extends Controller
             'recaudacion_hoy' => (float) (clone $pasosHoy)->where('estado', 'autorizado')->sum('monto'),
             'alertas_hoy' => (clone $pasosHoy)->where('estado', '!=', 'autorizado')->count(),
         ]);
+    }
+
+    public function verEvidencia(Paso $paso)
+    {
+        if (!empty($paso->imagen_base64)) {
+            $binario = base64_decode($paso->imagen_base64, true);
+            if ($binario !== false) {
+                return response($binario, 200)->header('Content-Type', 'image/jpeg');
+            }
+        }
+        abort(404);
+    }
+
+    public function verArchivoStorage(string $archivo)
+    {
+        $nombre = basename($archivo);
+        $ruta = storage_path('app/public/evidencias/' . $nombre);
+        if (is_file($ruta)) {
+            return response()->file($ruta);
+        }
+        $paso = Paso::where('imagen_url', 'like', "%{$nombre}%")->whereNotNull('imagen_base64')->first();
+        if ($paso) {
+            $binario = base64_decode($paso->imagen_base64, true);
+            if ($binario !== false) {
+                return response($binario, 200)->header('Content-Type', 'image/jpeg');
+            }
+        }
+        abort(404);
     }
 }

@@ -43,4 +43,10 @@ return [
 
     'inference_url' => env('INFERENCE_URL'),
 
+    'qwen' => [
+        'url' => env('QWEN_API_URL', 'https://router.huggingface.co/v1/chat/completions'),
+        'key' => env('QWEN_API_KEY'),
+        'model' => env('QWEN_MODEL', 'Qwen/Qwen2.5-7B-Instruct'),
+    ],
+
 ];

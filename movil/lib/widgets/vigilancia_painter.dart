@@ -162,7 +162,10 @@ class VigilanciaPainter extends CustomPainter {
       textDirection: TextDirection.ltr,
     )..layout();
 
-    final dx = pos.dx.clamp(0.0, (size.width - tp.width).clamp(0.0, size.width));
+    final dx = pos.dx.clamp(
+      0.0,
+      (size.width - tp.width).clamp(0.0, size.width),
+    );
     final dy = pos.dy.clamp(
       0.0,
       (size.height - tp.height - 4).clamp(0.0, size.height),
