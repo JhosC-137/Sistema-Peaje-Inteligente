@@ -316,6 +316,22 @@ def contar_ejes_en_recorte(
     return ejes, len(cercanas), puntos_rel, boxes_rel, keypoints_ejes_rel
 
 
+def _simplificar_mascara(poly: np.ndarray, max_puntos: int = 40) -> list[list[float]] | None:
+    """Simplifica un polígono normalizado [0..1] preservando bordes con Douglas-Peucker."""
+    if len(poly) < 3:
+        return None
+    pts = (poly * 1000.0).astype(np.float32).reshape(-1, 1, 2)
+    peri = cv2.arcLength(pts, True)
+    approx = cv2.approxPolyDP(pts, 0.004 * peri, True).reshape(-1, 2) / 1000.0
+    if len(approx) < 3:
+        step = max(1, len(poly) // max_puntos)
+        approx = poly[::step]
+    elif len(approx) > max_puntos:
+        step = max(1, len(approx) // max_puntos)
+        approx = approx[::step]
+    return [[round(float(p[0]), 4), round(float(p[1]), 4)] for p in approx]
+
+
 def segmentar_pasajeros_en_recorte(
     crop_v: np.ndarray, imgsz: int = 416
 ) -> tuple[int, list[list[list[float]]]]:
@@ -325,7 +341,7 @@ def segmentar_pasajeros_en_recorte(
         return 0, []
 
     res_p = modelo_pasajeros.predict(
-        crop_v, imgsz=imgsz, conf=0.20, device=DEVICE, half=USE_HALF, verbose=False
+        crop_v, imgsz=imgsz, conf=0.20, retina_masks=True, device=DEVICE, half=USE_HALF, verbose=False
     )[0]
     if res_p.boxes is None or len(res_p.boxes) == 0:
         return 0, []
@@ -342,17 +358,17 @@ def segmentar_pasajeros_en_recorte(
         if cy > ch * 0.78 or area_rel < 0.001:
             continue
 
-        if masks_xyn is not None and i < len(masks_xyn) and len(masks_xyn[i]) >= 3:
-            poly = masks_xyn[i]
-            step = max(1, len(poly) // 24)
-            mascaras_rel.append([[round(float(p[0]), 4), round(float(p[1]), 4)] for p in poly[::step]])
-        else:
-            mascaras_rel.append([
-                [round(px1 / cw, 4), round(py1 / ch, 4)],
-                [round(px2 / cw, 4), round(py1 / ch, 4)],
-                [round(px2 / cw, 4), round(py2 / ch, 4)],
-                [round(px1 / cw, 4), round(py2 / ch, 4)],
-            ])
+        if masks_xyn is not None and i < len(masks_xyn):
+            simp = _simplificar_mascara(masks_xyn[i], max_puntos=32)
+            if simp is not None:
+                mascaras_rel.append(simp)
+                continue
+        mascaras_rel.append([
+            [round(px1 / cw, 4), round(py1 / ch, 4)],
+            [round(px2 / cw, 4), round(py1 / ch, 4)],
+            [round(px2 / cw, 4), round(py2 / ch, 4)],
+            [round(px1 / cw, 4), round(py2 / ch, 4)],
+        ])
 
     return len(mascaras_rel), mascaras_rel
 
@@ -439,13 +455,13 @@ rastreador_http = RastreadorVigilancia()
 
 
 def _procesar_vehiculos_crop_first(
-    img: np.ndarray, max_vehiculos: int = 2, imgsz_m2: int = 384, imgsz_m3: int = 320, imgsz_m4: int = 416
+    img: np.ndarray, max_vehiculos: int = 2, imgsz_m2: int = 480, imgsz_m3: int = 384, imgsz_m4: int = 416
 ) -> list[dict]:
     """Detecta todos los vehículos con M2 y procesa ejes, placa y pasajeros por recorte."""
     h, w = img.shape[:2]
     with torch.inference_mode():
         res_m2 = modelo_m2.predict(
-            img, imgsz=imgsz_m2, conf=0.30, iou=0.50, device=DEVICE, half=USE_HALF, verbose=False
+            img, imgsz=imgsz_m2, conf=0.30, iou=0.50, retina_masks=True, device=DEVICE, half=USE_HALF, verbose=False
         )[0]
 
     detecciones: list[dict] = []
@@ -516,13 +532,7 @@ def _procesar_vehiculos_crop_first(
 
             mask_vehiculo = None
             if res_m2.masks is not None and idx < len(res_m2.masks.xyn):
-                poly_v = res_m2.masks.xyn[idx]
-                if len(poly_v) >= 3:
-                    step_v = max(1, len(poly_v) // 32)
-                    mask_vehiculo = [
-                        [round(float(p[0]), 4), round(float(p[1]), 4)]
-                        for p in poly_v[::step_v]
-                    ]
+                mask_vehiculo = _simplificar_mascara(res_m2.masks.xyn[idx], max_puntos=40)
 
             detecciones.append({
                 "vehiculo_detectado": True,
@@ -742,7 +752,7 @@ async def inferir(imagen: UploadFile = File(...)):
 def analizar_frame_vigilancia(img: np.ndarray, rastreador: RastreadorVigilancia) -> dict:
     """Detecta múltiples vehículos por recorte, estabiliza por IoU y segmenta pasajeros."""
     t0 = time.perf_counter()
-    detecciones = _procesar_vehiculos_crop_first(img, max_vehiculos=2, imgsz_m2=384, imgsz_m3=320, imgsz_m4=416)
+    detecciones = _procesar_vehiculos_crop_first(img, max_vehiculos=2, imgsz_m2=480, imgsz_m3=384, imgsz_m4=416)
     detecciones_estables = rastreador.actualizar(detecciones)
     latencia_ms = round((time.perf_counter() - t0) * 1000, 1)
 

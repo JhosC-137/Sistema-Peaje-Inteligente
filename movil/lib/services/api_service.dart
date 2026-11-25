@@ -86,6 +86,11 @@ class ApiService {
       Duration(seconds: timeoutSeconds),
     );
     final body = await streamed.stream.bytesToString();
+    if (!body.trimLeft().startsWith('{')) {
+      throw Exception(
+        'Respuesta no válida del servidor (HTTP ${streamed.statusCode}). Si enviaste un video grande, espera 1 min a que Render termine de desplegar o recorta el clip.',
+      );
+    }
     final data = jsonDecode(body);
 
     if (streamed.statusCode == 200) {

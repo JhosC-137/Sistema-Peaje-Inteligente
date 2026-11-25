@@ -36,9 +36,13 @@ class PeajeController extends Controller
         $inferenceUrl = config('services.inference_url') ?? env('INFERENCE_URL');
         if (!empty($inferenceUrl) && $request->hasFile('video')) {
             $videoFile = $request->file('video');
+            $stream = fopen($videoFile->getRealPath(), 'r');
             $response = Http::timeout(90)
-                ->attach('video', file_get_contents($videoFile->getRealPath()), $videoFile->getClientOriginalName() ?: 'clip.mp4')
+                ->attach('video', $stream, $videoFile->getClientOriginalName() ?: 'clip.mp4')
                 ->post(rtrim($inferenceUrl, '/') . '/inferir-video');
+            if (is_resource($stream)) {
+                fclose($stream);
+            }
 
             if (!$response->ok()) {
                 return response()->json(['error' => 'Fallo al procesar el video en el motor IA'], 502);
