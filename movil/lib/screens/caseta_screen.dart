@@ -133,11 +133,11 @@ Uint8List _convertirFrameAJpeg(_RawFrame frame) {
       ? img.copyRotate(decoded, angle: frame.sensorOrientation)
       : decoded;
 
-  if (orientada.width > 480) {
-    orientada = img.copyResize(orientada, width: 480);
+  if (orientada.width > 384) {
+    orientada = img.copyResize(orientada, width: 384);
   }
 
-  return Uint8List.fromList(img.encodeJpg(orientada, quality: 72));
+  return Uint8List.fromList(img.encodeJpg(orientada, quality: 60));
 }
 
 class CasetaScreen extends StatefulWidget {
@@ -785,9 +785,7 @@ class _CasetaScreenState extends State<CasetaScreen> {
                             const SizedBox(width: 6),
                             Text(
                               _wsConectado
-                                  ? (_usarHttpFallback
-                                        ? 'EN VIVO (HTTP)${_deteccionActual != null ? " • ${(_deteccionActual!['categoria'] ?? '').toString().toUpperCase()} ${_deteccionActual!['ejes'] ?? ''}e" : ""}'
-                                        : 'EN VIVO${_deteccionActual != null ? " • ${(_deteccionActual!['categoria'] ?? '').toString().toUpperCase()} ${_deteccionActual!['ejes'] ?? ''}e" : ""}')
+                                  ? '${_usarHttpFallback ? "EN VIVO (HTTP)" : "EN VIVO"}${_deteccionActual != null ? " • ${_deteccionActual!['latencia_ms'] ?? ''}ms (${_deteccionActual!['device'] ?? ''}) • ${(_deteccionActual!['categoria'] ?? '').toString().toUpperCase()} ${_deteccionActual!['ejes'] ?? ''}e" : ""}'
                                   : 'DESCONECTADO',
                               style: const TextStyle(
                                 color: Colors.white,

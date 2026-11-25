@@ -45,6 +45,16 @@ ocr_placas = (
 # Inicializar M2 y M3 (con fallback hasta entrenar los pesos propios)
 modelo_m2 = YOLO(str(M2_PATH)) if M2_PATH.exists() else YOLO("yolo11n-seg.pt")
 modelo_m3 = YOLO(str(M3_PATH)) if M3_PATH.exists() else None
+USE_HALF = DEVICE.startswith("cuda")
+
+# Warmup inicial para evitar latencia alta en la primera petición
+try:
+    _dummy = np.zeros((384, 384, 3), dtype=np.uint8)
+    modelo_m2.predict(_dummy, imgsz=384, conf=0.25, device=DEVICE, half=USE_HALF, verbose=False)
+    if modelo_m3 is not None:
+        modelo_m3.predict(_dummy, imgsz=384, conf=0.25, device=DEVICE, half=USE_HALF, verbose=False)
+except Exception:
+    pass
 
 MAPEO_CATEGORIAS = {
     "moto": "moto",
@@ -186,9 +196,13 @@ UMBRAL_CERCANA = 0.58
 SEPARACION_EJE = 0.52
 
 
-def _clasificar_vehiculo_detalle(img: np.ndarray) -> tuple[str, float, list[float], list[list[float]] | None]:
+def _clasificar_vehiculo_detalle(
+    img: np.ndarray, imgsz: int = 480
+) -> tuple[str, float, list[float], list[list[float]] | None]:
     """Etapa 2: Retorna categoría, confianza, caja [x1, y1, x2, y2] y polígono normalizado."""
-    res_m2 = modelo_m2.predict(img, conf=0.25, device=DEVICE, verbose=False)[0]
+    res_m2 = modelo_m2.predict(
+        img, imgsz=imgsz, conf=0.25, device=DEVICE, half=USE_HALF, verbose=False
+    )[0]
     if res_m2.boxes is None or len(res_m2.boxes) == 0:
         return "auto", 0.0, [0.0, 0.0, float(img.shape[1]), float(img.shape[0])], None
 
@@ -226,13 +240,15 @@ def _contenida(a: list[float], b: list[float]) -> float:
 
 
 def _contar_ejes_detalle(
-    img: np.ndarray, categoria: str, bbox_vehiculo: list[float]
+    img: np.ndarray, categoria: str, bbox_vehiculo: list[float], imgsz: int = 480
 ) -> tuple[int, int, list[list[float]], list[list[float]]]:
     """Etapa 3: Cuenta ejes y retorna coordenadas y cajas normalizadas de llantas cercanas."""
     if modelo_m3 is None:
         return (3 if categoria == "camion" else 2), 0, [], []
 
-    res_m3 = modelo_m3.predict(img, conf=0.25, device=DEVICE, verbose=False)[0]
+    res_m3 = modelo_m3.predict(
+        img, imgsz=imgsz, conf=0.25, device=DEVICE, half=USE_HALF, verbose=False
+    )[0]
     if res_m3.keypoints is None or res_m3.boxes is None or len(res_m3.boxes) == 0:
         return 2, 0, [], []
 
@@ -352,7 +368,11 @@ def dibujar_detecciones(
         cv2.rectangle(canvas, (px1, py_box - ph - 8), (px1 + pw + 10, py_box), (0, 214, 255), -1)
         cv2.putText(canvas, etiqueta_p, (px1 + 5, py_box - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 2)
 
-    ok, buf = cv2.imencode(".jpg", canvas, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    if w > 720:
+        escala = 720.0 / w
+        canvas = cv2.resize(canvas, (720, max(1, int(h * escala))), interpolation=cv2.INTER_AREA)
+
+    ok, buf = cv2.imencode(".jpg", canvas, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
     return base64.b64encode(buf.tobytes()).decode("ascii") if ok else ""
 
 
@@ -446,11 +466,16 @@ async def inferir(imagen: UploadFile = File(...)):
 
 
 def analizar_frame_vigilancia(img: np.ndarray) -> dict:
-    """Ejecuta M1, M2 y M3 y devuelve cajas/máscaras normalizadas (0.0 a 1.0) para overlay en vivo."""
+    """Ejecuta M1, M2 y M3 optimizado (384px) y devuelve cajas/máscaras normalizadas para overlay en vivo."""
+    t0 = time.perf_counter()
     h, w = img.shape[:2]
-    categoria, conf_m2, bbox_v, mask_v_norm = _clasificar_vehiculo_detalle(img)
-    ejes, llantas_det, llantas_norm, llantas_boxes = _contar_ejes_detalle(img, categoria, bbox_v)
+    categoria, conf_m2, bbox_v, mask_v_norm = _clasificar_vehiculo_detalle(img, imgsz=384)
+    if conf_m2 > 0.0:
+        ejes, llantas_det, llantas_norm, llantas_boxes = _contar_ejes_detalle(img, categoria, bbox_v, imgsz=384)
+    else:
+        ejes, llantas_det, llantas_norm, llantas_boxes = 2, 0, [], []
     _, placa_norm, conf_ocr, m1_ok, bbox_p = _detectar_placa_y_ocr_detalle(img)
+    latencia_ms = round((time.perf_counter() - t0) * 1000, 1)
 
     bbox_placa_norm = None
     if m1_ok and bbox_p is not None and w > 0 and h > 0:
@@ -476,6 +501,8 @@ def analizar_frame_vigilancia(img: np.ndarray) -> dict:
         "llantas": llantas_det,
         "llantas_puntos": llantas_norm,
         "llantas_boxes": llantas_boxes,
+        "latencia_ms": latencia_ms,
+        "device": DEVICE,
     }
 
 
