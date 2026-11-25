@@ -234,7 +234,7 @@ def _contenida(a: list[float], b: list[float]) -> float:
 
 
 def contar_ejes_en_recorte(
-    crop_v: np.ndarray, categoria: str
+    crop_v: np.ndarray, categoria: str, imgsz: int = 416
 ) -> tuple[int, int, list[list[float]], list[list[float]]]:
     """Etapa 3: Cuenta ejes sobre el recorte del vehículo usando M3 (keypoints/cajas de llantas)."""
     ch, cw = crop_v.shape[:2]
@@ -242,7 +242,7 @@ def contar_ejes_en_recorte(
         return (3 if categoria in ("bus", "camion") else 2), 0, [], []
 
     res_m3 = modelo_m3.predict(
-        crop_v, imgsz=640, conf=0.25, iou=0.45, device=DEVICE, half=USE_HALF, verbose=False
+        crop_v, imgsz=imgsz, conf=0.25, iou=0.45, device=DEVICE, half=USE_HALF, verbose=False
     )[0]
     if res_m3.boxes is None or len(res_m3.boxes) == 0:
         return (3 if categoria in ("bus", "camion") else 2), 0, [], []
@@ -306,14 +306,16 @@ def contar_ejes_en_recorte(
     return ejes, len(cercanas), puntos_rel, boxes_rel
 
 
-def segmentar_pasajeros_en_recorte(crop_v: np.ndarray) -> tuple[int, list[list[list[float]]]]:
+def segmentar_pasajeros_en_recorte(
+    crop_v: np.ndarray, imgsz: int = 320
+) -> tuple[int, list[list[list[float]]]]:
     """Etapa 4: Segmenta y cuenta pasajeros visibles dentro de la cabina del vehículo (sin rostros)."""
     ch, cw = crop_v.shape[:2]
     if ch < 40 or cw < 40 or modelo_pasajeros is None:
         return 0, []
 
     res_p = modelo_pasajeros.predict(
-        crop_v, imgsz=384, conf=0.30, classes=[0], device=DEVICE, half=USE_HALF, verbose=False
+        crop_v, imgsz=imgsz, conf=0.30, classes=[0], device=DEVICE, half=USE_HALF, verbose=False
     )[0]
     if res_p.boxes is None or len(res_p.boxes) == 0:
         return 0, []
@@ -426,11 +428,13 @@ class RastreadorVigilancia:
 rastreador_http = RastreadorVigilancia()
 
 
-def _procesar_vehiculos_crop_first(img: np.ndarray, max_vehiculos: int = 4) -> list[dict]:
+def _procesar_vehiculos_crop_first(
+    img: np.ndarray, max_vehiculos: int = 2, imgsz_m2: int = 416, imgsz_m3: int = 384, imgsz_m4: int = 320
+) -> list[dict]:
     """Detecta todos los vehículos con M2 (solo caja) y procesa ejes, placa y pasajeros por recorte."""
     h, w = img.shape[:2]
     res_m2 = modelo_m2.predict(
-        img, imgsz=640, conf=0.35, iou=0.50, device=DEVICE, half=USE_HALF, verbose=False
+        img, imgsz=imgsz_m2, conf=0.30, iou=0.50, device=DEVICE, half=USE_HALF, verbose=False
     )[0]
 
     detecciones: list[dict] = []
@@ -456,9 +460,9 @@ def _procesar_vehiculos_crop_first(img: np.ndarray, max_vehiculos: int = 4) -> l
             cw = max(1, cx2 - cx1)
             ch = max(1, cy2 - cy1)
 
-            ejes, llantas_det, pts_rel, lboxes_rel = contar_ejes_en_recorte(crop_v, categoria)
+            ejes, llantas_det, pts_rel, lboxes_rel = contar_ejes_en_recorte(crop_v, categoria, imgsz=imgsz_m3)
             placa_leida, placa_norm, conf_ocr, m1_ok, bbox_p_crop = _detectar_placa_y_ocr_detalle(crop_v)
-            pasajeros, mascaras_pas_rel = segmentar_pasajeros_en_recorte(crop_v)
+            pasajeros, mascaras_pas_rel = segmentar_pasajeros_en_recorte(crop_v, imgsz=imgsz_m4)
 
             bbox_placa_norm = None
             if m1_ok and bbox_p_crop is not None:
@@ -616,7 +620,7 @@ async def inferir(imagen: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="No se pudo decodificar la imagen enviada.")
 
     h, w = img.shape[:2]
-    detecciones = _procesar_vehiculos_crop_first(img, max_vehiculos=4)
+    detecciones = _procesar_vehiculos_crop_first(img, max_vehiculos=4, imgsz_m2=640, imgsz_m3=640, imgsz_m4=384)
 
     # Si M2 no detectó vehículos o la placa no salió dentro del recorte (ej. foto muy cercana)
     if not detecciones or not any(d["placa_detectada"] for d in detecciones):
@@ -680,7 +684,7 @@ async def inferir(imagen: UploadFile = File(...)):
 def analizar_frame_vigilancia(img: np.ndarray, rastreador: RastreadorVigilancia) -> dict:
     """Detecta múltiples vehículos por recorte, estabiliza por IoU y segmenta pasajeros."""
     t0 = time.perf_counter()
-    detecciones = _procesar_vehiculos_crop_first(img, max_vehiculos=4)
+    detecciones = _procesar_vehiculos_crop_first(img, max_vehiculos=2, imgsz_m2=416, imgsz_m3=384, imgsz_m4=320)
     detecciones_estables = rastreador.actualizar(detecciones)
     latencia_ms = round((time.perf_counter() - t0) * 1000, 1)
 

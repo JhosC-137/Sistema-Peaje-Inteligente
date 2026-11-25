@@ -133,11 +133,11 @@ Uint8List _convertirFrameAJpeg(_RawFrame frame) {
       ? img.copyRotate(decoded, angle: frame.sensorOrientation)
       : decoded;
 
-  if (orientada.width > 960) {
-    orientada = img.copyResize(orientada, width: 960);
+  if (orientada.width > 640) {
+    orientada = img.copyResize(orientada, width: 640);
   }
 
-  return Uint8List.fromList(img.encodeJpg(orientada, quality: 82));
+  return Uint8List.fromList(img.encodeJpg(orientada, quality: 72));
 }
 
 class CasetaScreen extends StatefulWidget {
@@ -212,7 +212,7 @@ class _CasetaScreenState extends State<CasetaScreen> {
 
     _cameraController = CameraController(
       trasera,
-      ResolutionPreset.high,
+      ResolutionPreset.medium,
       enableAudio: false,
       imageFormatGroup: Platform.isIOS
           ? ImageFormatGroup.bgra8888
@@ -804,7 +804,7 @@ class _CasetaScreenState extends State<CasetaScreen> {
                             const SizedBox(width: 6),
                             Text(
                               _wsConectado
-                                  ? '${_usarHttpFallback ? "EN VIVO (HTTP)" : "EN VIVO"}${_deteccionActual != null ? " • ${_deteccionActual!['latencia_ms'] ?? ''}ms • ${_deteccionActual!['total_vehiculos'] ?? 0} veh" : ""}'
+                                  ? '${_usarHttpFallback ? "EN VIVO (HTTP)" : "EN VIVO"}${_deteccionActual != null ? " • ${_deteccionActual!['latencia_ms'] ?? ''}ms (${_deteccionActual!['device'] ?? ''}) • ${_deteccionActual!['total_vehiculos'] ?? 0} veh" : ""}${_registrandoPaso ? " • Enviando..." : ""}'
                                   : 'DESCONECTADO',
                               style: const TextStyle(
                                 color: Colors.white,
