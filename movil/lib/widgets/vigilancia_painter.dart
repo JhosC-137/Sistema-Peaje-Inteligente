@@ -21,16 +21,53 @@ class VigilanciaPainter extends CustomPainter {
   }
 
   void _dibujarDeteccion(Canvas canvas, Size size, Map det) {
-    // 1. Máscaras de segmentación de pasajeros (magenta, sin rostro)
+    final confirmado = det['confirmado'] == true;
+    final colorVehiculo = confirmado
+        ? const Color(0xFF00E676)
+        : const Color(0xFF00E5FF);
+
+    // 1. Máscara de segmentación del vehículo (M2)
+    final maskVehiculo = det['mask_vehiculo'];
+    if (maskVehiculo is List && maskVehiculo.length >= 3) {
+      final pathV = Path();
+      for (int i = 0; i < maskVehiculo.length; i++) {
+        final pt = maskVehiculo[i];
+        if (pt is List && pt.length >= 2) {
+          final px = (pt[0] as num).toDouble() * size.width;
+          final py = (pt[1] as num).toDouble() * size.height;
+          if (i == 0) {
+            pathV.moveTo(px, py);
+          } else {
+            pathV.lineTo(px, py);
+          }
+        }
+      }
+      pathV.close();
+      canvas.drawPath(
+        pathV,
+        Paint()
+          ..color = colorVehiculo.withValues(alpha: 0.18)
+          ..style = PaintingStyle.fill,
+      );
+      canvas.drawPath(
+        pathV,
+        Paint()
+          ..color = colorVehiculo
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.6,
+      );
+    }
+
+    // 2. Máscaras de segmentación de pasajeros (magenta, sin rostro)
     final mascarasPasajeros = det['mascaras_pasajeros'];
     if (mascarasPasajeros is List) {
       final fillPasajero = Paint()
-        ..color = const Color(0xFFE040FB).withValues(alpha: 0.28)
+        ..color = const Color(0xFFE040FB).withValues(alpha: 0.34)
         ..style = PaintingStyle.fill;
       final strokePasajero = Paint()
         ..color = const Color(0xFFE040FB)
         ..style = PaintingStyle.stroke
-        ..strokeWidth = 1.8;
+        ..strokeWidth = 2.0;
 
       for (final poly in mascarasPasajeros) {
         if (poly is List && poly.length >= 3) {
@@ -54,13 +91,9 @@ class VigilanciaPainter extends CustomPainter {
       }
     }
 
-    // 2. Solo caja del vehículo (sin segmentación del auto): verde si confirmado, cian si rastreando
+    // 3. Caja del vehículo (M2)
     final bv = det['bbox_vehiculo'];
     if (bv is List && bv.length == 4) {
-      final confirmado = det['confirmado'] == true;
-      final colorVehiculo = confirmado
-          ? const Color(0xFF00E676)
-          : const Color(0xFF00E5FF);
 
       final rect = Rect.fromLTRB(
         (bv[0] as num).toDouble() * size.width,

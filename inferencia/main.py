@@ -30,7 +30,8 @@ M1_DET_PATH = WEIGHTS_DIR / "yolo-v9-t-384-license-plates-end2end.onnx"
 M1_OCR_PATH = WEIGHTS_DIR / "cct_xs_v2_global.onnx"
 M1_CFG_PATH = WEIGHTS_DIR / "cct_xs_v2_global_plate_config.yaml"
 M2_PATH = WEIGHTS_DIR / "m2_vehiculos.pt"
-M3_PATH = WEIGHTS_DIR / "m3_ejes.pt"
+M3_PATH = WEIGHTS_DIR / "m3_llantas.pt"
+M3_ALT_PATH = WEIGHTS_DIR / "m3_ejes.pt"
 M4_PATH = WEIGHTS_DIR / "m4_pasajeros_seg.pt"
 M4_ALT_PATH = WEIGHTS_DIR / "m4_pasajeros.pt"
 YOLO_SEG_FALLBACK = BASE_DIR / "yolo11n-seg.pt"
@@ -47,9 +48,10 @@ ocr_placas = (
     else None
 )
 
-# Inicializar M2 (vehículos), M3 (ejes) y M4 (solo si existe modelo entrenado de pasajeros)
+# Inicializar M2 (vehículos seg), M3 (llantas keypoints) y M4 (pasajeros seg)
 modelo_m2 = YOLO(str(M2_PATH)) if M2_PATH.exists() else YOLO(str(YOLO_SEG_FALLBACK) if YOLO_SEG_FALLBACK.exists() else "yolo11n-seg.pt")
-modelo_m3 = YOLO(str(M3_PATH)) if M3_PATH.exists() else None
+_m3_peso = M3_PATH if M3_PATH.exists() else (M3_ALT_PATH if M3_ALT_PATH.exists() else None)
+modelo_m3 = YOLO(str(_m3_peso)) if _m3_peso is not None else None
 _m4_peso = M4_PATH if M4_PATH.exists() else (M4_ALT_PATH if M4_ALT_PATH.exists() else None)
 modelo_pasajeros = YOLO(str(_m4_peso)) if _m4_peso is not None else None
 USE_HALF = DEVICE.startswith("cuda")
@@ -508,11 +510,22 @@ def _procesar_vehiculos_crop_first(
                 for poly in mascaras_pas_rel
             ]
 
+            mask_vehiculo = None
+            if res_m2.masks is not None and idx < len(res_m2.masks.xyn):
+                poly_v = res_m2.masks.xyn[idx]
+                if len(poly_v) >= 3:
+                    step_v = max(1, len(poly_v) // 32)
+                    mask_vehiculo = [
+                        [round(float(p[0]), 4), round(float(p[1]), 4)]
+                        for p in poly_v[::step_v]
+                    ]
+
             detecciones.append({
                 "vehiculo_detectado": True,
                 "categoria": categoria,
                 "conf_vehiculo": round(conf_m2, 4),
                 "bbox_vehiculo": [round(vx1 / w, 4), round(vy1 / h, 4), round(vx2 / w, 4), round(vy2 / h, 4)],
+                "mask_vehiculo": mask_vehiculo,
                 "placa_detectada": m1_ok,
                 "placa_leida": placa_leida,
                 "placa": placa_norm,
@@ -531,25 +544,35 @@ def _procesar_vehiculos_crop_first(
 
 
 def dibujar_detecciones_multi(img: np.ndarray, detecciones: list[dict]) -> str:
-    """Dibuja cajas de vehículos (sin segmentar autos), ejes, placas y máscaras segmentadas de pasajeros."""
+    """Dibuja segmentación y caja de vehículos, pasajeros segmentados, ejes y placas."""
     canvas = img.copy()
     h, w = canvas.shape[:2]
 
     for det in detecciones:
-        # 1. Máscaras de segmentación de pasajeros (magenta, sin recortes faciales)
+        color_v = (118, 230, 0) if det.get("confirmado", True) else (255, 229, 0)
+
+        # 1. Máscara de segmentación del vehículo (M2)
+        mask_v = det.get("mask_vehiculo")
+        if mask_v and len(mask_v) >= 3:
+            pts_v = np.array([[int(p[0] * w), int(p[1] * h)] for p in mask_v], dtype=np.int32)
+            overlay_v = canvas.copy()
+            cv2.fillPoly(overlay_v, [pts_v], color_v)
+            cv2.addWeighted(overlay_v, 0.20, canvas, 0.80, 0, canvas)
+            cv2.polylines(canvas, [pts_v], True, color_v, 2)
+
+        # 2. Máscaras de segmentación de pasajeros (magenta, sin recortes faciales)
         for poly in det.get("mascaras_pasajeros", []):
             if len(poly) >= 3:
                 pts = np.array([[int(p[0] * w), int(p[1] * h)] for p in poly], dtype=np.int32)
                 overlay = canvas.copy()
                 cv2.fillPoly(overlay, [pts], (251, 64, 224))
-                cv2.addWeighted(overlay, 0.30, canvas, 0.70, 0, canvas)
+                cv2.addWeighted(overlay, 0.35, canvas, 0.65, 0, canvas)
                 cv2.polylines(canvas, [pts], True, (251, 64, 224), 2)
 
-        # 2. Solo caja del vehículo (sin segmentación del auto)
+        # 3. Caja del vehículo (M2)
         bv = det.get("bbox_vehiculo")
         if bv:
             vx1, vy1, vx2, vy2 = int(bv[0] * w), int(bv[1] * h), int(bv[2] * w), int(bv[3] * h)
-            color_v = (118, 230, 0) if det.get("confirmado", True) else (255, 229, 0)
             cv2.rectangle(canvas, (vx1, vy1), (vx2, vy2), color_v, 2)
             pas = det.get("pasajeros", 0)
             pas_txt = f" | {pas} PAS" if pas > 0 else ""
@@ -610,7 +633,7 @@ def health():
             "m1_detector_onnx": det_placas is not None,
             "m1_ocr_onnx": ocr_placas is not None,
             "m2_vehiculos": M2_PATH.exists(),
-            "m3_ejes": M3_PATH.exists(),
+            "m3_ejes": modelo_m3 is not None,
             "m4_pasajeros_seg": modelo_pasajeros is not None,
         },
     }
@@ -658,6 +681,7 @@ async def inferir(imagen: UploadFile = File(...)):
                 "categoria": "auto",
                 "conf_vehiculo": 0.0,
                 "bbox_vehiculo": None,
+                "mask_vehiculo": None,
                 "placa_detectada": m1_ok,
                 "placa_leida": p_leida,
                 "placa": p_norm,
@@ -691,6 +715,7 @@ async def inferir(imagen: UploadFile = File(...)):
         "pasajeros": principal["pasajeros"],
         "latencia": latencia_ms,
         "bbox_vehiculo": principal["bbox_vehiculo"],
+        "mask_vehiculo": principal.get("mask_vehiculo"),
         "bbox_placa": principal["bbox_placa"],
         "llantas_puntos": principal["llantas_puntos"],
         "llantas_boxes": principal["llantas_boxes"],
