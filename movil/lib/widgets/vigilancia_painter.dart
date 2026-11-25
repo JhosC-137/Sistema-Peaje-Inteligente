@@ -68,7 +68,34 @@ class VigilanciaPainter extends CustomPainter {
       );
     }
 
-    // 3. Keypoints de llantas detectadas (M3)
+    // 3. Cajas y keypoints de llantas / ejes detectados (M3)
+    final llantasBoxes = data['llantas_boxes'];
+    if (llantasBoxes is List) {
+      final paintLlantaBox = Paint()
+        ..color = const Color(0xFFFF9100)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2.0;
+      for (int i = 0; i < llantasBoxes.length; i++) {
+        final lb = llantasBoxes[i];
+        if (lb is List && lb.length == 4) {
+          final rectL = Rect.fromLTRB(
+            (lb[0] as num).toDouble() * size.width,
+            (lb[1] as num).toDouble() * size.height,
+            (lb[2] as num).toDouble() * size.width,
+            (lb[3] as num).toDouble() * size.height,
+          );
+          canvas.drawRect(rectL, paintLlantaBox);
+          _dibujarEtiqueta(
+            canvas,
+            size,
+            Offset(rectL.left, rectL.top - 16),
+            'L${i + 1}',
+            const Color(0xFFFF9100),
+          );
+        }
+      }
+    }
+
     final llantas = data['llantas_puntos'];
     if (llantas is List) {
       final fillLlanta = Paint()..color = const Color(0xFFFF9100);

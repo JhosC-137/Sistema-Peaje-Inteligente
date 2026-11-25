@@ -453,8 +453,12 @@ class _CasetaScreenState extends State<CasetaScreen> {
       );
 
       if (!mounted) return;
+      final det = respuesta['deteccion'];
       setState(() {
         _ultimoResultado = respuesta;
+        if (det is Map<String, dynamic>) {
+          _deteccionActual = det;
+        }
       });
     } catch (e) {
       if (!mounted) return;
@@ -672,7 +676,7 @@ class _CasetaScreenState extends State<CasetaScreen> {
                           fit: StackFit.expand,
                           children: [
                             CameraPreview(_cameraController!),
-                            if (_modoVigilanciaActivo)
+                            if (_deteccionActual != null)
                               CustomPaint(
                                 painter: VigilanciaPainter(_deteccionActual),
                               ),
@@ -790,13 +794,15 @@ class _CasetaScreenState extends State<CasetaScreen> {
     );
   }
 
-  void _verImagenAnotada(String url) {
+  void _verImagenAnotada({Uint8List? bytes, String? url}) {
     showDialog(
       context: context,
       builder: (_) => Dialog(
         backgroundColor: Colors.black,
         child: InteractiveViewer(
-          child: Image.network(url, fit: BoxFit.contain),
+          child: bytes != null
+              ? Image.memory(bytes, fit: BoxFit.contain)
+              : Image.network(url!, fit: BoxFit.contain),
         ),
       ),
     );
@@ -807,6 +813,13 @@ class _CasetaScreenState extends State<CasetaScreen> {
     final paso = data['paso'] ?? {};
     final saldo = data['saldo_restante'];
     final imagenUrl = paso['imagen_url']?.toString();
+    final b64 = data['imagen_anotada_b64']?.toString();
+    Uint8List? imagenBytes;
+    if (b64 != null && b64.isNotEmpty) {
+      try {
+        imagenBytes = base64Decode(b64);
+      } catch (_) {}
+    }
 
     Color colorBorde;
     Color colorFondo;
@@ -837,20 +850,28 @@ class _CasetaScreenState extends State<CasetaScreen> {
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          if (imagenUrl != null && imagenUrl.isNotEmpty)
+          if (imagenBytes != null ||
+              (imagenUrl != null && imagenUrl.isNotEmpty))
             GestureDetector(
-              onTap: () => _verImagenAnotada(imagenUrl),
+              onTap: () => _verImagenAnotada(bytes: imagenBytes, url: imagenUrl),
               child: Padding(
                 padding: const EdgeInsets.only(right: 12),
                 child: ClipRRect(
                   borderRadius: BorderRadius.circular(8),
-                  child: Image.network(
-                    imagenUrl,
-                    width: 60,
-                    height: 60,
-                    fit: BoxFit.cover,
-                    errorBuilder: (_, _, _) => const SizedBox.shrink(),
-                  ),
+                  child: imagenBytes != null
+                      ? Image.memory(
+                          imagenBytes,
+                          width: 68,
+                          height: 68,
+                          fit: BoxFit.cover,
+                        )
+                      : Image.network(
+                          imagenUrl!,
+                          width: 68,
+                          height: 68,
+                          fit: BoxFit.cover,
+                          errorBuilder: (_, _, _) => const SizedBox.shrink(),
+                        ),
                 ),
               ),
             ),

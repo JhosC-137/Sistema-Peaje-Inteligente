@@ -225,14 +225,16 @@ def _contenida(a: list[float], b: list[float]) -> float:
     return inter / area
 
 
-def _contar_ejes_detalle(img: np.ndarray, categoria: str, bbox_vehiculo: list[float]) -> tuple[int, int, list[list[float]]]:
-    """Etapa 3: Cuenta ejes y retorna coordenadas [x, y] normalizadas de llantas cercanas."""
+def _contar_ejes_detalle(
+    img: np.ndarray, categoria: str, bbox_vehiculo: list[float]
+) -> tuple[int, int, list[list[float]], list[list[float]]]:
+    """Etapa 3: Cuenta ejes y retorna coordenadas y cajas normalizadas de llantas cercanas."""
     if modelo_m3 is None:
-        return (3 if categoria == "camion" else 2), 0, []
+        return (3 if categoria == "camion" else 2), 0, [], []
 
     res_m3 = modelo_m3.predict(img, conf=0.35, device=DEVICE, verbose=False)[0]
     if res_m3.keypoints is None or res_m3.boxes is None or len(res_m3.boxes) == 0:
-        return 2, 0, []
+        return 2, 0, [], []
 
     cajas = res_m3.boxes.xyxy.cpu().numpy()
     kpts_xy = res_m3.keypoints.xy.cpu().numpy()
@@ -254,15 +256,16 @@ def _contar_ejes_detalle(img: np.ndarray, categoria: str, bbox_vehiculo: list[fl
         and (vy1 + 0.35 * vh <= l["kps"][0, 1] <= vy2 + 0.10 * vh)
     ]
     if not asociadas:
-        return 2, 0, []
+        return 2, 0, [], []
 
     # 3. Descartar llantas del lado opuesto usando altura visible (contacto.y - superior.y)
     alturas = [max(1.0, float(l["kps"][1, 1] - l["kps"][2, 1])) for l in asociadas]
     hmax = max(alturas)
     cercanas = [l for l, h in zip(asociadas, alturas) if h >= UMBRAL_CERCANA * hmax]
+    cercanas.sort(key=lambda l: float(l["kps"][0, 0]))
 
     # 4. Agrupar ruedas gemelas según el diámetro mediano de llanta
-    xs = sorted(float(l["kps"][0, 0]) for l in cercanas)
+    xs = [float(l["kps"][0, 0]) for l in cercanas]
     diam = float(np.median([max(1.0, float(l["kps"][1, 1] - l["kps"][2, 1])) for l in cercanas]))
     ejes = 1 + sum(1 for p, q in zip(xs, xs[1:]) if (q - p) > SEPARACION_EJE * diam)
 
@@ -270,17 +273,26 @@ def _contar_ejes_detalle(img: np.ndarray, categoria: str, bbox_vehiculo: list[fl
     if categoria in ("moto", "auto", "minibus") and ejes > 2:
         ejes = 2
 
-    h_img, w_img = img.shape[:2]
+    h_img, w_img = max(1, img.shape[0]), max(1, img.shape[1])
     puntos_norm = [
-        [round(float(l["kps"][0, 0]) / max(1, w_img), 4), round(float(l["kps"][0, 1]) / max(1, h_img), 4)]
+        [round(float(l["kps"][0, 0]) / w_img, 4), round(float(l["kps"][0, 1]) / h_img, 4)]
         for l in cercanas
     ]
-    return ejes, len(cercanas), puntos_norm
+    boxes_norm = [
+        [
+            round(float(l["box"][0]) / w_img, 4),
+            round(float(l["box"][1]) / h_img, 4),
+            round(float(l["box"][2]) / w_img, 4),
+            round(float(l["box"][3]) / h_img, 4),
+        ]
+        for l in cercanas
+    ]
+    return ejes, len(cercanas), puntos_norm, boxes_norm
 
 
 def contar_ejes(img: np.ndarray, categoria: str, bbox_vehiculo: list[float]) -> tuple[int, int]:
     """Etapa 3: Cuenta ejes asociando los 5 keypoints de llantas al vehículo principal."""
-    ejes, total, _ = _contar_ejes_detalle(img, categoria, bbox_vehiculo)
+    ejes, total, _, _ = _contar_ejes_detalle(img, categoria, bbox_vehiculo)
     return ejes, total
 
 
@@ -292,12 +304,13 @@ def dibujar_detecciones(
     mask_v_norm: list[list[float]] | None,
     ejes: int,
     llantas_norm: list[list[float]],
+    llantas_boxes: list[list[float]],
     placa_norm: str,
     conf_ocr: float,
     m1_ok: bool,
     bbox_p: list[int] | None,
 ) -> str:
-    """Dibuja segmentación/caja del vehículo, puntos de llantas y caja/texto de la placa en JPEG base64."""
+    """Dibuja segmentación/caja del vehículo, cajas/puntos de llantas y caja/texto de la placa en JPEG base64."""
     canvas = img.copy()
     h, w = canvas.shape[:2]
 
@@ -318,11 +331,16 @@ def dibujar_detecciones(
         cv2.rectangle(canvas, (vx1, ty - th - 8), (vx1 + tw + 10, ty), (118, 230, 0), -1)
         cv2.putText(canvas, etiqueta_v, (vx1 + 5, ty - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
 
-    # 2. Puntos de llantas detectadas (M3)
+    # 2. Cajas y puntos de llantas / ejes detectados (M3)
+    for idx_l, lbox in enumerate(llantas_boxes, start=1):
+        lx1, ly1, lx2, ly2 = int(lbox[0] * w), int(lbox[1] * h), int(lbox[2] * w), int(lbox[3] * h)
+        cv2.rectangle(canvas, (lx1, ly1), (lx2, ly2), (0, 145, 255), 2)
+        cv2.putText(canvas, f"L{idx_l}", (lx1, max(14, ly1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 145, 255), 2)
+
     for lx, ly in llantas_norm:
         cx, cy = int(lx * w), int(ly * h)
-        cv2.circle(canvas, (cx, cy), 7, (0, 165, 255), -1)
-        cv2.circle(canvas, (cx, cy), 9, (255, 255, 255), 2)
+        cv2.circle(canvas, (cx, cy), 6, (0, 165, 255), -1)
+        cv2.circle(canvas, (cx, cy), 8, (255, 255, 255), 2)
 
     # 3. Caja de la placa + caracteres leídos (M1 + OCR)
     if m1_ok and bbox_p is not None:
@@ -385,9 +403,9 @@ async def inferir(imagen: UploadFile = File(...)):
     h, w = img.shape[:2]
     placa_leida, placa_normalizada, confianza_ocr, m1_ok, bbox_p = _detectar_placa_y_ocr_detalle(img)
     categoria, conf_m2, bbox_vehiculo, mask_v_norm = _clasificar_vehiculo_detalle(img)
-    ejes, llantas_detectadas, llantas_norm = _contar_ejes_detalle(img, categoria, bbox_vehiculo)
+    ejes, llantas_detectadas, llantas_norm, llantas_boxes = _contar_ejes_detalle(img, categoria, bbox_vehiculo)
     imagen_anotada_b64 = dibujar_detecciones(
-        img, categoria, conf_m2, bbox_vehiculo, mask_v_norm, ejes, llantas_norm,
+        img, categoria, conf_m2, bbox_vehiculo, mask_v_norm, ejes, llantas_norm, llantas_boxes,
         placa_normalizada, confianza_ocr, m1_ok, bbox_p,
     )
     latencia_ms = round((time.perf_counter() - t0) * 1000, 2)
@@ -412,7 +430,10 @@ async def inferir(imagen: UploadFile = File(...)):
         "pasajeros": 0,
         "latencia": latencia_ms,
         "bbox_vehiculo": bbox_vehiculo_norm,
+        "mask_vehiculo": mask_v_norm if conf_m2 > 0.40 else None,
         "bbox_placa": bbox_placa_norm,
+        "llantas_puntos": llantas_norm,
+        "llantas_boxes": llantas_boxes,
         "imagen_anotada_b64": imagen_anotada_b64,
         "detalles": {
             "device": DEVICE,
@@ -428,7 +449,7 @@ def analizar_frame_vigilancia(img: np.ndarray) -> dict:
     """Ejecuta M1, M2 y M3 y devuelve cajas/máscaras normalizadas (0.0 a 1.0) para overlay en vivo."""
     h, w = img.shape[:2]
     categoria, conf_m2, bbox_v, mask_v_norm = _clasificar_vehiculo_detalle(img)
-    ejes, llantas_det, llantas_norm = _contar_ejes_detalle(img, categoria, bbox_v)
+    ejes, llantas_det, llantas_norm, llantas_boxes = _contar_ejes_detalle(img, categoria, bbox_v)
     _, placa_norm, conf_ocr, m1_ok, bbox_p = _detectar_placa_y_ocr_detalle(img)
 
     bbox_placa_norm = None
@@ -454,6 +475,7 @@ def analizar_frame_vigilancia(img: np.ndarray) -> dict:
         "ejes": ejes,
         "llantas": llantas_det,
         "llantas_puntos": llantas_norm,
+        "llantas_boxes": llantas_boxes,
     }
 
 

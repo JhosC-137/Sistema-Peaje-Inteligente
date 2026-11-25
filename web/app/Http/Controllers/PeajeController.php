@@ -115,6 +115,17 @@ class PeajeController extends Controller
             'estado' => $estado,
             'paso' => $paso,
             'saldo_restante' => $vehiculo ? $vehiculo->fresh()->saldo : null,
+            'imagen_anotada_b64' => $ia['imagen_anotada_b64'] ?? null,
+            'deteccion' => [
+                'categoria' => $categoria,
+                'ejes' => $ejes,
+                'placa' => $placaNorm ?: 'ILEGIBLE',
+                'bbox_vehiculo' => $ia['bbox_vehiculo'] ?? null,
+                'mask_vehiculo' => $ia['mask_vehiculo'] ?? null,
+                'bbox_placa' => $ia['bbox_placa'] ?? null,
+                'llantas_puntos' => $ia['llantas_puntos'] ?? [],
+                'llantas_boxes' => $ia['llantas_boxes'] ?? [],
+            ],
         ]);
     }
 
