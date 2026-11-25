@@ -1,6 +1,7 @@
 import re
 import time
 import base64
+from collections import Counter, deque
 import cv2
 import torch
 import numpy as np
@@ -11,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from ultralytics import YOLO
 from fast_plate_ocr import LicensePlateRecognizer
 
-app = FastAPI(title="Smart Toll Inference API", version="1.1.0")
+app = FastAPI(title="Smart Toll Inference API", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,14 +22,17 @@ app.add_middleware(
 )
 
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
-WEIGHTS_DIR = Path(__file__).parent / "weights"
+BASE_DIR = Path(__file__).parent
+WEIGHTS_DIR = BASE_DIR / "weights"
 
-# Rutas de modelos M1 (ONNX) y M2/M3 (YOLOv11)
+# Rutas de modelos M1 (ONNX), M2/M3 (YOLOv11) y M4 Pasajeros (YOLOv11-seg)
 M1_DET_PATH = WEIGHTS_DIR / "yolo-v9-t-384-license-plates-end2end.onnx"
 M1_OCR_PATH = WEIGHTS_DIR / "cct_xs_v2_global.onnx"
 M1_CFG_PATH = WEIGHTS_DIR / "cct_xs_v2_global_plate_config.yaml"
 M2_PATH = WEIGHTS_DIR / "m2_vehiculos.pt"
 M3_PATH = WEIGHTS_DIR / "m3_ejes.pt"
+M4_PATH = WEIGHTS_DIR / "m4_pasajeros.pt"
+YOLO_SEG_FALLBACK = BASE_DIR / "yolo11n-seg.pt"
 
 # Inicializar M1 Detector ONNX + OCR especializado
 providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if torch.cuda.is_available() else ["CPUExecutionProvider"]
@@ -42,9 +46,14 @@ ocr_placas = (
     else None
 )
 
-# Inicializar M2 y M3 (con fallback hasta entrenar los pesos propios)
-modelo_m2 = YOLO(str(M2_PATH)) if M2_PATH.exists() else YOLO("yolo11n-seg.pt")
+# Inicializar M2 (vehículos), M3 (ejes) y M4 (pasajeros segmentados)
+modelo_m2 = YOLO(str(M2_PATH)) if M2_PATH.exists() else YOLO(str(YOLO_SEG_FALLBACK) if YOLO_SEG_FALLBACK.exists() else "yolo11n-seg.pt")
 modelo_m3 = YOLO(str(M3_PATH)) if M3_PATH.exists() else None
+modelo_pasajeros = (
+    YOLO(str(M4_PATH))
+    if M4_PATH.exists()
+    else YOLO(str(YOLO_SEG_FALLBACK) if YOLO_SEG_FALLBACK.exists() else "yolo11n-seg.pt")
+)
 USE_HALF = DEVICE.startswith("cuda")
 
 # Warmup inicial para evitar latencia alta en la primera petición
@@ -53,6 +62,8 @@ try:
     modelo_m2.predict(_dummy, imgsz=384, conf=0.25, device=DEVICE, half=USE_HALF, verbose=False)
     if modelo_m3 is not None:
         modelo_m3.predict(_dummy, imgsz=384, conf=0.25, device=DEVICE, half=USE_HALF, verbose=False)
+    if modelo_pasajeros is not None:
+        modelo_pasajeros.predict(_dummy, imgsz=384, conf=0.30, classes=[0], device=DEVICE, half=USE_HALF, verbose=False)
 except Exception:
     pass
 
@@ -111,50 +122,29 @@ def _letterbox_384(img: np.ndarray, size: int = 384):
     return tensor, scale, dw, dh
 
 
-def _detectar_placa_y_ocr_detalle(img: np.ndarray) -> tuple[str, str, float, bool, list[int] | None]:
-    """Etapa 1: Detecta placa con YOLOv9 ONNX, lee caracteres con CCT-XS-V2 y retorna su bbox."""
-    roi = img
-    placa_detectada = False
-    bbox_placa: list[int] | None = None
-    h, w = img.shape[:2]
+def _aplicar_clahe(roi: np.ndarray) -> np.ndarray:
+    """Normaliza iluminación y reflejos en el recorte de placa antes del OCR."""
+    if roi.size == 0:
+        return roi
+    lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    l = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4)).apply(l)
+    return cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
 
-    if det_placas is not None:
-        tensor, scale, dw, dh = _letterbox_384(img, 384)
-        input_name = det_placas.get_inputs()[0].name
-        dets = det_placas.run(None, {input_name: tensor})[0]
 
-        if dets is not None and len(dets) > 0:
-            if dets.shape[-1] == 7:
-                scores = dets[:, 6]
-                boxes = dets[:, 1:5]
-            else:
-                scores = dets[:, 4]
-                boxes = dets[:, :4]
+def _ejecutar_ocr_roi(roi: np.ndarray) -> tuple[str, str, float]:
+    """Ejecuta fast-plate-ocr sobre un recorte de placa y retorna (crudo, normalizado, confianza)."""
+    if ocr_placas is None or roi.size == 0:
+        return "ILEGIBLE", "ILEGIBLE", 0.0
 
-            validos = np.where(scores >= 0.25)[0]
-            if len(validos) > 0:
-                mejor = validos[int(np.argmax(scores[validos]))]
-                bx1, by1, bx2, by2 = boxes[mejor]
-                pad = 6
-                x1 = int(max(0, (bx1 - dw) / scale - pad))
-                y1 = int(max(0, (by1 - dh) / scale - pad))
-                x2 = int(min(w, (bx2 - dw) / scale + pad))
-                y2 = int(min(h, (by2 - dh) / scale + pad))
-                if x2 > x1 and y2 > y1:
-                    roi = img[y1:y2, x1:x2]
-                    placa_detectada = True
-                    bbox_placa = [x1, y1, x2, y2]
-
-    if ocr_placas is None or not placa_detectada:
-        return "ILEGIBLE", "ILEGIBLE", 0.0, placa_detectada, bbox_placa
-
+    roi_norm = _aplicar_clahe(roi)
     try:
-        res_ocr = ocr_placas.run(roi, return_confidence=True)
+        res_ocr = ocr_placas.run(roi_norm, return_confidence=True)
     except TypeError:
-        res_ocr = ocr_placas.run(roi)
+        res_ocr = ocr_placas.run(roi_norm)
 
     if not res_ocr:
-        return "ILEGIBLE", "ILEGIBLE", 0.0, placa_detectada, bbox_placa
+        return "ILEGIBLE", "ILEGIBLE", 0.0
 
     if isinstance(res_ocr, tuple) and len(res_ocr) == 2:
         lecturas, probs = res_ocr
@@ -175,60 +165,64 @@ def _detectar_placa_y_ocr_detalle(img: np.ndarray) -> tuple[str, str, float, boo
             texto_raw = str(pred)
             confianza_ocr = 0.0
 
-    # Eliminar caracteres de relleno '_' propios del modelo CCT
     placa_leida = texto_raw.replace("_", "").strip()
-
     if not placa_leida:
-        return "ILEGIBLE", "ILEGIBLE", 0.0, placa_detectada, bbox_placa
+        return "ILEGIBLE", "ILEGIBLE", 0.0
 
     placa_norm = normalizar_placa_bolivia(placa_leida) or "ILEGIBLE"
-    return placa_leida, placa_norm, round(confianza_ocr, 4), placa_detectada, bbox_placa
+    return placa_leida, placa_norm, round(confianza_ocr, 4)
 
 
-def detectar_placa_y_ocr(img: np.ndarray) -> tuple[str, str, float, bool]:
-    """Etapa 1: Detecta placa con YOLOv9 ONNX y lee caracteres con CCT-XS-V2."""
-    placa_leida, placa_norm, confianza_ocr, placa_detectada, _ = _detectar_placa_y_ocr_detalle(img)
-    return placa_leida, placa_norm, confianza_ocr, placa_detectada
+def _detectar_placa_y_ocr_detalle(img: np.ndarray) -> tuple[str, str, float, bool, list[int] | None]:
+    """Etapa 1: Detecta placa con YOLOv9 ONNX, mejora contraste con CLAHE y lee caracteres."""
+    if det_placas is None or img.size == 0:
+        return "ILEGIBLE", "ILEGIBLE", 0.0, False, None
+
+    h, w = img.shape[:2]
+    tensor, scale, dw, dh = _letterbox_384(img, 384)
+    input_name = det_placas.get_inputs()[0].name
+    dets = det_placas.run(None, {input_name: tensor})[0]
+
+    if dets is None or len(dets) == 0:
+        return "ILEGIBLE", "ILEGIBLE", 0.0, False, None
+
+    if dets.shape[-1] == 7:
+        scores = dets[:, 6]
+        boxes = dets[:, 1:5]
+    else:
+        scores = dets[:, 4]
+        boxes = dets[:, :4]
+
+    validos = np.where(scores >= 0.28)[0]
+    if len(validos) == 0:
+        return "ILEGIBLE", "ILEGIBLE", 0.0, False, None
+
+    mejor = validos[int(np.argmax(scores[validos]))]
+    bx1, by1, bx2, by2 = boxes[mejor]
+    x1_raw = max(0.0, (bx1 - dw) / scale)
+    y1_raw = max(0.0, (by1 - dh) / scale)
+    x2_raw = min(float(w), (bx2 - dw) / scale)
+    y2_raw = min(float(h), (by2 - dh) / scale)
+
+    pad_x = max(4.0, (x2_raw - x1_raw) * 0.08)
+    pad_y = max(4.0, (y2_raw - y1_raw) * 0.12)
+    x1 = int(max(0, x1_raw - pad_x))
+    y1 = int(max(0, y1_raw - pad_y))
+    x2 = int(min(w, x2_raw + pad_x))
+    y2 = int(min(h, y2_raw + pad_y))
+
+    if x2 <= x1 or y2 <= y1:
+        return "ILEGIBLE", "ILEGIBLE", 0.0, False, None
+
+    roi = img[y1:y2, x1:x2]
+    bbox_placa = [x1, y1, x2, y2]
+    placa_leida, placa_norm, confianza_ocr = _ejecutar_ocr_roi(roi)
+    return placa_leida, placa_norm, confianza_ocr, True, bbox_placa
 
 
 UMBRAL_CONTENCION = 0.70
 UMBRAL_CERCANA = 0.58
 SEPARACION_EJE = 0.52
-
-
-def _clasificar_vehiculo_detalle(
-    img: np.ndarray, imgsz: int = 480
-) -> tuple[str, float, list[float], list[list[float]] | None]:
-    """Etapa 2: Retorna categoría, confianza, caja [x1, y1, x2, y2] y polígono normalizado."""
-    res_m2 = modelo_m2.predict(
-        img, imgsz=imgsz, conf=0.25, device=DEVICE, half=USE_HALF, verbose=False
-    )[0]
-    if res_m2.boxes is None or len(res_m2.boxes) == 0:
-        return "auto", 0.0, [0.0, 0.0, float(img.shape[1]), float(img.shape[0])], None
-
-    cajas = res_m2.boxes.xyxy.cpu().numpy()
-    areas = (cajas[:, 2] - cajas[:, 0]) * (cajas[:, 3] - cajas[:, 1])
-    idx = int(np.argmax(areas))
-
-    cls_id = int(res_m2.boxes.cls[idx].item())
-    conf = float(res_m2.boxes.conf[idx].item())
-    nombre_clase = str(res_m2.names[cls_id]).lower().strip()
-    categoria = MAPEO_CATEGORIAS.get(nombre_clase, "auto")
-
-    mask_norm: list[list[float]] | None = None
-    if res_m2.masks is not None and idx < len(res_m2.masks.xyn):
-        poly = res_m2.masks.xyn[idx]
-        if len(poly) >= 3:
-            step = max(1, len(poly) // 36)
-            mask_norm = [[round(float(p[0]), 4), round(float(p[1]), 4)] for p in poly[::step]]
-
-    return categoria, round(conf, 4), cajas[idx].tolist(), mask_norm
-
-
-def clasificar_vehiculo(img: np.ndarray) -> tuple[str, float, list[float]]:
-    """Etapa 2: Retorna categoría, confianza y caja [x1, y1, x2, y2] del vehículo principal."""
-    categoria, conf, bbox, _ = _clasificar_vehiculo_detalle(img)
-    return categoria, conf, bbox
 
 
 def _contenida(a: list[float], b: list[float]) -> float:
@@ -239,134 +233,334 @@ def _contenida(a: list[float], b: list[float]) -> float:
     return inter / area
 
 
-def _contar_ejes_detalle(
-    img: np.ndarray, categoria: str, bbox_vehiculo: list[float], imgsz: int = 480
+def contar_ejes_en_recorte(
+    crop_v: np.ndarray, categoria: str
 ) -> tuple[int, int, list[list[float]], list[list[float]]]:
-    """Etapa 3: Cuenta ejes y retorna coordenadas y cajas normalizadas de llantas cercanas."""
-    if modelo_m3 is None:
-        return (3 if categoria == "camion" else 2), 0, [], []
+    """Etapa 3: Cuenta ejes sobre el recorte del vehículo usando M3 (keypoints/cajas de llantas)."""
+    ch, cw = crop_v.shape[:2]
+    if ch < 30 or cw < 30 or modelo_m3 is None:
+        return (3 if categoria in ("bus", "camion") else 2), 0, [], []
 
     res_m3 = modelo_m3.predict(
-        img, imgsz=imgsz, conf=0.25, device=DEVICE, half=USE_HALF, verbose=False
+        crop_v, imgsz=640, conf=0.25, iou=0.45, device=DEVICE, half=USE_HALF, verbose=False
     )[0]
-    if res_m3.keypoints is None or res_m3.boxes is None or len(res_m3.boxes) == 0:
-        return 2, 0, [], []
+    if res_m3.boxes is None or len(res_m3.boxes) == 0:
+        return (3 if categoria in ("bus", "camion") else 2), 0, [], []
 
     cajas = res_m3.boxes.xyxy.cpu().numpy()
-    kpts_xy = res_m3.keypoints.xy.cpu().numpy()
+    kpts_xy = res_m3.keypoints.xy.cpu().numpy() if res_m3.keypoints is not None else None
 
-    # 1. Descartar detecciones internas (ej. aros dentro de la llanta)
+    # 1. Descartar detecciones internas (aros dentro de llanta)
     orden = np.argsort(-((cajas[:, 2] - cajas[:, 0]) * (cajas[:, 3] - cajas[:, 1])))
     llantas = []
     for idx in orden:
         box = cajas[idx].tolist()
         if all(_contenida(box, r["box"]) < UMBRAL_CONTENCION for r in llantas):
-            llantas.append({"box": box, "kps": kpts_xy[idx]})
+            kps = kpts_xy[idx] if kpts_xy is not None else None
+            llantas.append({"box": box, "kps": kps})
 
-    # 2. Filtrar solo llantas ubicadas en la parte inferior del vehículo principal
-    vx1, vy1, vx2, vy2 = bbox_vehiculo
-    vw, vh = vx2 - vx1, vy2 - vy1
-    asociadas = [
-        l for l in llantas
-        if (vx1 - 0.05 * vw <= l["kps"][0, 0] <= vx2 + 0.05 * vw)
-        and (vy1 + 0.35 * vh <= l["kps"][0, 1] <= vy2 + 0.10 * vh)
-    ]
+    # 2. Filtrar solo llantas en la parte inferior del vehículo (ignorar espejos/luces)
+    asociadas = []
+    for l in llantas:
+        bx1, by1, bx2, by2 = l["box"]
+        cx = float(l["kps"][0, 0]) if l["kps"] is not None and l["kps"][0, 0] > 0 else (bx1 + bx2) / 2.0
+        cy = float(l["kps"][0, 1]) if l["kps"] is not None and l["kps"][0, 1] > 0 else (by1 + by2) / 2.0
+        if cy >= ch * 0.40:
+            l["cx"] = cx
+            l["cy"] = cy
+            l["vis_h"] = (
+                max(1.0, float(l["kps"][1, 1] - l["kps"][2, 1]))
+                if l["kps"] is not None and l["kps"][1, 1] > l["kps"][2, 1]
+                else max(1.0, by2 - by1)
+            )
+            asociadas.append(l)
+
     if not asociadas:
-        return 2, 0, [], []
+        return (3 if categoria in ("bus", "camion") else 2), 0, [], []
 
-    # 3. Descartar llantas del lado opuesto usando altura visible (contacto.y - superior.y)
-    alturas = [max(1.0, float(l["kps"][1, 1] - l["kps"][2, 1])) for l in asociadas]
-    hmax = max(alturas)
-    cercanas = [l for l, h in zip(asociadas, alturas) if h >= UMBRAL_CERCANA * hmax]
-    cercanas.sort(key=lambda l: float(l["kps"][0, 0]))
+    # 3. Filtrar lado cercano usando altura visible
+    hmax = max(l["vis_h"] for l in asociadas)
+    cercanas = [l for l in asociadas if l["vis_h"] >= UMBRAL_CERCANA * hmax]
+    cercanas.sort(key=lambda l: l["cx"])
 
-    # 4. Agrupar ruedas gemelas según el diámetro mediano de llanta
-    xs = [float(l["kps"][0, 0]) for l in cercanas]
-    diam = float(np.median([max(1.0, float(l["kps"][1, 1] - l["kps"][2, 1])) for l in cercanas]))
-    ejes = 1 + sum(1 for p, q in zip(xs, xs[1:]) if (q - p) > SEPARACION_EJE * diam)
+    # 4. Agrupar llantas gemelas por separación horizontal
+    xs = [l["cx"] for l in cercanas]
+    diam = float(np.median([l["vis_h"] for l in cercanas]))
+    umbral_sep = max(cw * 0.08, SEPARACION_EJE * diam)
+    ejes = 1 + sum(1 for p, q in zip(xs, xs[1:]) if (q - p) > umbral_sep)
 
     ejes = max(2, min(6, ejes))
     if categoria in ("moto", "auto", "minibus") and ejes > 2:
         ejes = 2
 
-    h_img, w_img = max(1, img.shape[0]), max(1, img.shape[1])
-    puntos_norm = [
-        [round(float(l["kps"][0, 0]) / w_img, 4), round(float(l["kps"][0, 1]) / h_img, 4)]
-        for l in cercanas
-    ]
-    boxes_norm = [
+    puntos_rel = [[round(l["cx"] / cw, 4), round(l["cy"] / ch, 4)] for l in cercanas]
+    boxes_rel = [
         [
-            round(float(l["box"][0]) / w_img, 4),
-            round(float(l["box"][1]) / h_img, 4),
-            round(float(l["box"][2]) / w_img, 4),
-            round(float(l["box"][3]) / h_img, 4),
+            round(max(0.0, l["box"][0]) / cw, 4),
+            round(max(0.0, l["box"][1]) / ch, 4),
+            round(min(float(cw), l["box"][2]) / cw, 4),
+            round(min(float(ch), l["box"][3]) / ch, 4),
         ]
         for l in cercanas
     ]
-    return ejes, len(cercanas), puntos_norm, boxes_norm
+    return ejes, len(cercanas), puntos_rel, boxes_rel
 
 
-def contar_ejes(img: np.ndarray, categoria: str, bbox_vehiculo: list[float]) -> tuple[int, int]:
-    """Etapa 3: Cuenta ejes asociando los 5 keypoints de llantas al vehículo principal."""
-    ejes, total, _, _ = _contar_ejes_detalle(img, categoria, bbox_vehiculo)
-    return ejes, total
+def segmentar_pasajeros_en_recorte(crop_v: np.ndarray) -> tuple[int, list[list[list[float]]]]:
+    """Etapa 4: Segmenta y cuenta pasajeros visibles dentro de la cabina del vehículo (sin rostros)."""
+    ch, cw = crop_v.shape[:2]
+    if ch < 40 or cw < 40 or modelo_pasajeros is None:
+        return 0, []
+
+    res_p = modelo_pasajeros.predict(
+        crop_v, imgsz=384, conf=0.30, classes=[0], device=DEVICE, half=USE_HALF, verbose=False
+    )[0]
+    if res_p.boxes is None or len(res_p.boxes) == 0:
+        return 0, []
+
+    mascaras_rel: list[list[list[float]]] = []
+    boxes = res_p.boxes.xyxy.cpu().numpy()
+    masks_xyn = res_p.masks.xyn if res_p.masks is not None else None
+
+    for i, box in enumerate(boxes):
+        px1, py1, px2, py2 = box.tolist()
+        cy = (py1 + py2) / 2.0
+        area_rel = ((px2 - px1) * (py2 - py1)) / max(1.0, cw * ch)
+        # Filtrar personas visibles en zona de cabina/parabrisas y evitar ruido diminuto
+        if cy > ch * 0.80 or area_rel < 0.002:
+            continue
+
+        if masks_xyn is not None and i < len(masks_xyn) and len(masks_xyn[i]) >= 3:
+            poly = masks_xyn[i]
+            step = max(1, len(poly) // 24)
+            mascaras_rel.append([[round(float(p[0]), 4), round(float(p[1]), 4)] for p in poly[::step]])
+        else:
+            mascaras_rel.append([
+                [round(px1 / cw, 4), round(py1 / ch, 4)],
+                [round(px2 / cw, 4), round(py1 / ch, 4)],
+                [round(px2 / cw, 4), round(py2 / ch, 4)],
+                [round(px1 / cw, 4), round(py2 / ch, 4)],
+            ])
+
+    return len(mascaras_rel), mascaras_rel
 
 
-def dibujar_detecciones(
-    img: np.ndarray,
-    categoria: str,
-    conf_m2: float,
-    bbox_v: list[float],
-    mask_v_norm: list[list[float]] | None,
-    ejes: int,
-    llantas_norm: list[list[float]],
-    llantas_boxes: list[list[float]],
-    placa_norm: str,
-    conf_ocr: float,
-    m1_ok: bool,
-    bbox_p: list[int] | None,
-) -> str:
-    """Dibuja segmentación/caja del vehículo, cajas/puntos de llantas y caja/texto de la placa en JPEG base64."""
+def calcular_iou(b1: list[float], b2: list[float]) -> float:
+    xA, yA = max(b1[0], b2[0]), max(b1[1], b2[1])
+    xB, yB = min(b1[2], b2[2]), min(b1[3], b2[3])
+    inter = max(0.0, xB - xA) * max(0.0, yB - yA)
+    area1 = max(1e-6, (b1[2] - b1[0]) * (b1[3] - b1[1]))
+    area2 = max(1e-6, (b2[2] - b2[0]) * (b2[3] - b2[1]))
+    return inter / (area1 + area2 - inter)
+
+
+class RastreadorVigilancia:
+    """Estabiliza placa, ejes, categoría y pasajeros mediante consenso temporal por IoU."""
+
+    def __init__(self):
+        self.tracks: dict[int, dict] = {}
+        self.next_id = 1
+
+    def actualizar(self, detecciones_frame: list[dict]) -> list[dict]:
+        nuevos_tracks: dict[int, dict] = {}
+        salida: list[dict] = []
+
+        for det in detecciones_frame:
+            bbox = det["bbox_vehiculo"]
+            mejor_id, mejor_iou = None, 0.35
+            for tid, tr in self.tracks.items():
+                iou = calcular_iou(bbox, tr["bbox"])
+                if iou > mejor_iou:
+                    mejor_iou, mejor_id = iou, tid
+
+            if mejor_id is None:
+                tid = self.next_id
+                self.next_id += 1
+                tr = {
+                    "bbox": bbox,
+                    "placas": deque(maxlen=6),
+                    "ejes": deque(maxlen=6),
+                    "categorias": deque(maxlen=6),
+                    "pasajeros": deque(maxlen=6),
+                }
+            else:
+                tid = mejor_id
+                tr = self.tracks[tid]
+                tr["bbox"] = bbox
+
+            placa_act = det.get("placa", "")
+            if placa_act and placa_act != "ILEGIBLE" and det.get("conf_ocr", 0.0) >= 0.60:
+                tr["placas"].append((placa_act, float(det["conf_ocr"])))
+            tr["ejes"].append(int(det["ejes"]))
+            tr["categorias"].append(str(det["categoria"]))
+            tr["pasajeros"].append(int(det.get("pasajeros", 0)))
+
+            ejes_estables = Counter(tr["ejes"]).most_common(1)[0][0]
+            cat_estable = Counter(tr["categorias"]).most_common(1)[0][0]
+            pasajeros_estables = Counter(tr["pasajeros"]).most_common(1)[0][0]
+
+            placa_estable, conf_media, confirmado = "ILEGIBLE", 0.0, False
+            if tr["placas"]:
+                conteo = Counter(p for p, _ in tr["placas"])
+                placa_estable, repeticiones = conteo.most_common(1)[0]
+                confs = [c for p, c in tr["placas"] if p == placa_estable]
+                conf_media = round(sum(confs) / len(confs), 3)
+                confirmado = repeticiones >= 2 and conf_media >= 0.72
+
+            nuevos_tracks[tid] = tr
+            det.update({
+                "track_id": tid,
+                "categoria": cat_estable,
+                "ejes": ejes_estables,
+                "pasajeros": pasajeros_estables,
+                "placa": placa_estable,
+                "conf_ocr": conf_media,
+                "confirmado": confirmado,
+            })
+            salida.append(det)
+
+        self.tracks = nuevos_tracks
+        return salida
+
+
+rastreador_http = RastreadorVigilancia()
+
+
+def _procesar_vehiculos_crop_first(img: np.ndarray, max_vehiculos: int = 4) -> list[dict]:
+    """Detecta todos los vehículos con M2 (solo caja) y procesa ejes, placa y pasajeros por recorte."""
+    h, w = img.shape[:2]
+    res_m2 = modelo_m2.predict(
+        img, imgsz=640, conf=0.35, iou=0.50, device=DEVICE, half=USE_HALF, verbose=False
+    )[0]
+
+    detecciones: list[dict] = []
+    if res_m2.boxes is not None and len(res_m2.boxes) > 0:
+        cajas = res_m2.boxes.xyxy.cpu().numpy()
+        areas = (cajas[:, 2] - cajas[:, 0]) * (cajas[:, 3] - cajas[:, 1])
+        orden = np.argsort(-areas)[:max_vehiculos]
+
+        for idx in orden:
+            vx1, vy1, vx2, vy2 = cajas[idx].tolist()
+            cls_id = int(res_m2.boxes.cls[idx].item())
+            conf_m2 = float(res_m2.boxes.conf[idx].item())
+            nombre_clase = str(res_m2.names[cls_id]).lower().strip()
+            categoria = MAPEO_CATEGORIAS.get(nombre_clase, "auto")
+
+            vw, vh = vx2 - vx1, vy2 - vy1
+            mx, my = vw * 0.08, vh * 0.08
+            cx1 = int(max(0, vx1 - mx))
+            cy1 = int(max(0, vy1 - my))
+            cx2 = int(min(w, vx2 + mx))
+            cy2 = int(min(h, vy2 + my))
+            crop_v = img[cy1:cy2, cx1:cx2]
+            cw = max(1, cx2 - cx1)
+            ch = max(1, cy2 - cy1)
+
+            ejes, llantas_det, pts_rel, lboxes_rel = contar_ejes_en_recorte(crop_v, categoria)
+            placa_leida, placa_norm, conf_ocr, m1_ok, bbox_p_crop = _detectar_placa_y_ocr_detalle(crop_v)
+            pasajeros, mascaras_pas_rel = segmentar_pasajeros_en_recorte(crop_v)
+
+            bbox_placa_norm = None
+            if m1_ok and bbox_p_crop is not None:
+                px1, py1, px2, py2 = bbox_p_crop
+                bbox_placa_norm = [
+                    round((cx1 + px1) / w, 4),
+                    round((cy1 + py1) / h, 4),
+                    round((cx1 + px2) / w, 4),
+                    round((cy1 + py2) / h, 4),
+                ]
+
+            llantas_puntos = [
+                [round((cx1 + pt[0] * cw) / w, 4), round((cy1 + pt[1] * ch) / h, 4)]
+                for pt in pts_rel
+            ]
+            llantas_boxes = [
+                [
+                    round((cx1 + lb[0] * cw) / w, 4),
+                    round((cy1 + lb[1] * ch) / h, 4),
+                    round((cx1 + lb[2] * cw) / w, 4),
+                    round((cy1 + lb[3] * ch) / h, 4),
+                ]
+                for lb in lboxes_rel
+            ]
+            mascaras_pasajeros = [
+                [[round((cx1 + p[0] * cw) / w, 4), round((cy1 + p[1] * ch) / h, 4)] for p in poly]
+                for poly in mascaras_pas_rel
+            ]
+
+            detecciones.append({
+                "vehiculo_detectado": True,
+                "categoria": categoria,
+                "conf_vehiculo": round(conf_m2, 4),
+                "bbox_vehiculo": [round(vx1 / w, 4), round(vy1 / h, 4), round(vx2 / w, 4), round(vy2 / h, 4)],
+                "placa_detectada": m1_ok,
+                "placa_leida": placa_leida,
+                "placa": placa_norm,
+                "conf_ocr": conf_ocr,
+                "bbox_placa": bbox_placa_norm,
+                "ejes": ejes,
+                "llantas": llantas_det,
+                "llantas_puntos": llantas_puntos,
+                "llantas_boxes": llantas_boxes,
+                "pasajeros": pasajeros,
+                "mascaras_pasajeros": mascaras_pasajeros,
+            })
+
+    return detecciones
+
+
+def dibujar_detecciones_multi(img: np.ndarray, detecciones: list[dict]) -> str:
+    """Dibuja cajas de vehículos (sin segmentar autos), ejes, placas y máscaras segmentadas de pasajeros."""
     canvas = img.copy()
     h, w = canvas.shape[:2]
 
-    # 1. Máscara de segmentación semitransparente + caja del vehículo (M2)
-    if conf_m2 > 0.0:
-        if mask_v_norm:
-            pts = np.array([[int(p[0] * w), int(p[1] * h)] for p in mask_v_norm], dtype=np.int32)
-            overlay = canvas.copy()
-            cv2.fillPoly(overlay, [pts], (118, 230, 0))
-            cv2.addWeighted(overlay, 0.22, canvas, 0.78, 0, canvas)
-            cv2.polylines(canvas, [pts], True, (118, 230, 0), 2)
+    for det in detecciones:
+        # 1. Máscaras de segmentación de pasajeros (magenta, sin recortes faciales)
+        for poly in det.get("mascaras_pasajeros", []):
+            if len(poly) >= 3:
+                pts = np.array([[int(p[0] * w), int(p[1] * h)] for p in poly], dtype=np.int32)
+                overlay = canvas.copy()
+                cv2.fillPoly(overlay, [pts], (251, 64, 224))
+                cv2.addWeighted(overlay, 0.30, canvas, 0.70, 0, canvas)
+                cv2.polylines(canvas, [pts], True, (251, 64, 224), 2)
 
-        vx1, vy1, vx2, vy2 = [int(v) for v in bbox_v]
-        cv2.rectangle(canvas, (vx1, vy1), (vx2, vy2), (118, 230, 0), 2)
-        etiqueta_v = f"{categoria.upper()} | {ejes} EJES ({int(conf_m2 * 100)}%)"
-        (tw, th), _ = cv2.getTextSize(etiqueta_v, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-        ty = max(th + 8, vy1)
-        cv2.rectangle(canvas, (vx1, ty - th - 8), (vx1 + tw + 10, ty), (118, 230, 0), -1)
-        cv2.putText(canvas, etiqueta_v, (vx1 + 5, ty - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+        # 2. Solo caja del vehículo (sin segmentación del auto)
+        bv = det.get("bbox_vehiculo")
+        if bv:
+            vx1, vy1, vx2, vy2 = int(bv[0] * w), int(bv[1] * h), int(bv[2] * w), int(bv[3] * h)
+            color_v = (118, 230, 0) if det.get("confirmado", True) else (255, 229, 0)
+            cv2.rectangle(canvas, (vx1, vy1), (vx2, vy2), color_v, 2)
+            pas = det.get("pasajeros", 0)
+            pas_txt = f" | {pas} PAS" if pas > 0 else ""
+            etiqueta_v = f"{det['categoria'].upper()} | {det['ejes']} EJES{pas_txt}"
+            (tw, th), _ = cv2.getTextSize(etiqueta_v, cv2.FONT_HERSHEY_SIMPLEX, 0.58, 2)
+            ty = max(th + 8, vy1)
+            cv2.rectangle(canvas, (vx1, ty - th - 8), (vx1 + tw + 10, ty), color_v, -1)
+            cv2.putText(canvas, etiqueta_v, (vx1 + 5, ty - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 0, 0), 2)
 
-    # 2. Cajas y puntos de llantas / ejes detectados (M3)
-    for idx_l, lbox in enumerate(llantas_boxes, start=1):
-        lx1, ly1, lx2, ly2 = int(lbox[0] * w), int(lbox[1] * h), int(lbox[2] * w), int(lbox[3] * h)
-        cv2.rectangle(canvas, (lx1, ly1), (lx2, ly2), (0, 145, 255), 2)
-        cv2.putText(canvas, f"L{idx_l}", (lx1, max(14, ly1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 145, 255), 2)
+        # 3. Cajas y keypoints de llantas / ejes (naranja)
+        for idx_l, lbox in enumerate(det.get("llantas_boxes", []), start=1):
+            lx1, ly1, lx2, ly2 = int(lbox[0] * w), int(lbox[1] * h), int(lbox[2] * w), int(lbox[3] * h)
+            cv2.rectangle(canvas, (lx1, ly1), (lx2, ly2), (0, 145, 255), 2)
+            cv2.putText(canvas, f"L{idx_l}", (lx1, max(14, ly1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 145, 255), 2)
 
-    for lx, ly in llantas_norm:
-        cx, cy = int(lx * w), int(ly * h)
-        cv2.circle(canvas, (cx, cy), 6, (0, 165, 255), -1)
-        cv2.circle(canvas, (cx, cy), 8, (255, 255, 255), 2)
+        for lx, ly in det.get("llantas_puntos", []):
+            cx, cy = int(lx * w), int(ly * h)
+            cv2.circle(canvas, (cx, cy), 5, (0, 165, 255), -1)
+            cv2.circle(canvas, (cx, cy), 7, (255, 255, 255), 1)
 
-    # 3. Caja de la placa + caracteres leídos (M1 + OCR)
-    if m1_ok and bbox_p is not None:
-        px1, py1, px2, py2 = [int(v) for v in bbox_p]
-        cv2.rectangle(canvas, (px1, py1), (px2, py2), (0, 214, 255), 3)
-        etiqueta_p = f"{placa_norm} ({int(conf_ocr * 100)}%)" if placa_norm and placa_norm != "ILEGIBLE" else "ILEGIBLE"
-        (pw, ph), _ = cv2.getTextSize(etiqueta_p, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
-        py_box = min(h - 4, py2 + ph + 10)
-        cv2.rectangle(canvas, (px1, py_box - ph - 8), (px1 + pw + 10, py_box), (0, 214, 255), -1)
-        cv2.putText(canvas, etiqueta_p, (px1 + 5, py_box - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 2)
+        # 4. Caja de la placa + caracteres leídos (amarillo)
+        bp = det.get("bbox_placa")
+        if bp:
+            px1, py1, px2, py2 = int(bp[0] * w), int(bp[1] * h), int(bp[2] * w), int(bp[3] * h)
+            cv2.rectangle(canvas, (px1, py1), (px2, py2), (0, 214, 255), 3)
+            placa = det.get("placa", "ILEGIBLE")
+            conf_ocr = det.get("conf_ocr", 0.0)
+            etiqueta_p = f"{placa} ({int(conf_ocr * 100)}%)" if placa and placa != "ILEGIBLE" else "ILEGIBLE"
+            (pw, ph), _ = cv2.getTextSize(etiqueta_p, cv2.FONT_HERSHEY_SIMPLEX, 0.62, 2)
+            py_box = min(h - 4, py2 + ph + 10)
+            cv2.rectangle(canvas, (px1, py_box - ph - 8), (px1 + pw + 10, py_box), (0, 214, 255), -1)
+            cv2.putText(canvas, etiqueta_p, (px1 + 5, py_box - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 0, 0), 2)
 
     if w > 720:
         escala = 720.0 / w
@@ -386,6 +580,7 @@ def health():
             "m1_ocr_onnx": ocr_placas is not None,
             "m2_vehiculos": M2_PATH.exists(),
             "m3_ejes": M3_PATH.exists(),
+            "m4_pasajeros_seg": modelo_pasajeros is not None,
         },
     }
 
@@ -421,86 +616,82 @@ async def inferir(imagen: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="No se pudo decodificar la imagen enviada.")
 
     h, w = img.shape[:2]
-    placa_leida, placa_normalizada, confianza_ocr, m1_ok, bbox_p = _detectar_placa_y_ocr_detalle(img)
-    categoria, conf_m2, bbox_vehiculo, mask_v_norm = _clasificar_vehiculo_detalle(img)
-    ejes, llantas_detectadas, llantas_norm, llantas_boxes = _contar_ejes_detalle(img, categoria, bbox_vehiculo)
-    imagen_anotada_b64 = dibujar_detecciones(
-        img, categoria, conf_m2, bbox_vehiculo, mask_v_norm, ejes, llantas_norm, llantas_boxes,
-        placa_normalizada, confianza_ocr, m1_ok, bbox_p,
-    )
+    detecciones = _procesar_vehiculos_crop_first(img, max_vehiculos=4)
+
+    # Si M2 no detectó vehículos o la placa no salió dentro del recorte (ej. foto muy cercana)
+    if not detecciones or not any(d["placa_detectada"] for d in detecciones):
+        p_leida, p_norm, conf_ocr, m1_ok, bbox_p = _detectar_placa_y_ocr_detalle(img)
+        if not detecciones:
+            detecciones = [{
+                "vehiculo_detectado": False,
+                "categoria": "auto",
+                "conf_vehiculo": 0.0,
+                "bbox_vehiculo": None,
+                "placa_detectada": m1_ok,
+                "placa_leida": p_leida,
+                "placa": p_norm,
+                "conf_ocr": conf_ocr,
+                "bbox_placa": [round(bbox_p[0] / w, 4), round(bbox_p[1] / h, 4), round(bbox_p[2] / w, 4), round(bbox_p[3] / h, 4)] if m1_ok and bbox_p else None,
+                "ejes": 2,
+                "llantas": 0,
+                "llantas_puntos": [],
+                "llantas_boxes": [],
+                "pasajeros": 0,
+                "mascaras_pasajeros": [],
+            }]
+        elif m1_ok:
+            detecciones[0]["placa_detectada"] = True
+            detecciones[0]["placa_leida"] = p_leida
+            detecciones[0]["placa"] = p_norm
+            detecciones[0]["conf_ocr"] = conf_ocr
+            detecciones[0]["bbox_placa"] = [round(bbox_p[0] / w, 4), round(bbox_p[1] / h, 4), round(bbox_p[2] / w, 4), round(bbox_p[3] / h, 4)] if bbox_p else None
+
+    principal = max(detecciones, key=lambda d: (1 if d["placa_detectada"] and d["placa"] != "ILEGIBLE" else 0, d["conf_vehiculo"]))
+    imagen_anotada_b64 = dibujar_detecciones_multi(img, detecciones)
     latencia_ms = round((time.perf_counter() - t0) * 1000, 2)
 
-    bbox_placa_norm = (
-        [round(bbox_p[0] / w, 4), round(bbox_p[1] / h, 4), round(bbox_p[2] / w, 4), round(bbox_p[3] / h, 4)]
-        if m1_ok and bbox_p is not None and w > 0 and h > 0
-        else None
-    )
-    bbox_vehiculo_norm = (
-        [round(bbox_vehiculo[0] / w, 4), round(bbox_vehiculo[1] / h, 4), round(bbox_vehiculo[2] / w, 4), round(bbox_vehiculo[3] / h, 4)]
-        if conf_m2 > 0.0 and w > 0 and h > 0
-        else None
-    )
-
     return {
-        "placa_leida": placa_leida,
-        "placa_normalizada": placa_normalizada,
-        "confianza_ocr": confianza_ocr,
-        "categoria_detectada": categoria,
-        "ejes_detectados": ejes,
-        "pasajeros": 0,
+        "placa_leida": principal["placa_leida"],
+        "placa_normalizada": principal["placa"],
+        "confianza_ocr": principal["conf_ocr"],
+        "categoria_detectada": principal["categoria"],
+        "ejes_detectados": principal["ejes"],
+        "pasajeros": principal["pasajeros"],
         "latencia": latencia_ms,
-        "bbox_vehiculo": bbox_vehiculo_norm,
-        "mask_vehiculo": mask_v_norm if conf_m2 > 0.0 else None,
-        "bbox_placa": bbox_placa_norm,
-        "llantas_puntos": llantas_norm,
-        "llantas_boxes": llantas_boxes,
+        "bbox_vehiculo": principal["bbox_vehiculo"],
+        "bbox_placa": principal["bbox_placa"],
+        "llantas_puntos": principal["llantas_puntos"],
+        "llantas_boxes": principal["llantas_boxes"],
+        "mascaras_pasajeros": principal["mascaras_pasajeros"],
+        "detecciones": detecciones,
         "imagen_anotada_b64": imagen_anotada_b64,
         "detalles": {
             "device": DEVICE,
-            "m1_placa_detectada": m1_ok,
-            "m2_confianza": conf_m2,
-            "m3_llantas_detectadas": llantas_detectadas,
+            "m1_placa_detectada": principal["placa_detectada"],
+            "m2_confianza": principal["conf_vehiculo"],
+            "m3_llantas_detectadas": principal["llantas"],
+            "pasajeros_segmentados": principal["pasajeros"],
+            "total_vehiculos": len(detecciones),
             "latencia_ms": latencia_ms,
         },
     }
 
 
-def analizar_frame_vigilancia(img: np.ndarray) -> dict:
-    """Ejecuta M1, M2 y M3 optimizado (384px) y devuelve cajas/máscaras normalizadas para overlay en vivo."""
+def analizar_frame_vigilancia(img: np.ndarray, rastreador: RastreadorVigilancia) -> dict:
+    """Detecta múltiples vehículos por recorte, estabiliza por IoU y segmenta pasajeros."""
     t0 = time.perf_counter()
-    h, w = img.shape[:2]
-    categoria, conf_m2, bbox_v, mask_v_norm = _clasificar_vehiculo_detalle(img, imgsz=384)
-    if conf_m2 > 0.0:
-        ejes, llantas_det, llantas_norm, llantas_boxes = _contar_ejes_detalle(img, categoria, bbox_v, imgsz=384)
-    else:
-        ejes, llantas_det, llantas_norm, llantas_boxes = 2, 0, [], []
-    _, placa_norm, conf_ocr, m1_ok, bbox_p = _detectar_placa_y_ocr_detalle(img)
+    detecciones = _procesar_vehiculos_crop_first(img, max_vehiculos=4)
+    detecciones_estables = rastreador.actualizar(detecciones)
     latencia_ms = round((time.perf_counter() - t0) * 1000, 1)
 
-    bbox_placa_norm = None
-    if m1_ok and bbox_p is not None and w > 0 and h > 0:
-        x1, y1, x2, y2 = bbox_p
-        bbox_placa_norm = [round(x1 / w, 4), round(y1 / h, 4), round(x2 / w, 4), round(y2 / h, 4)]
-
-    bbox_vehiculo_norm = None
-    if conf_m2 > 0.0 and w > 0 and h > 0:
-        vx1, vy1, vx2, vy2 = bbox_v
-        bbox_vehiculo_norm = [round(vx1 / w, 4), round(vy1 / h, 4), round(vx2 / w, 4), round(vy2 / h, 4)]
-
+    principal = detecciones_estables[0] if detecciones_estables else None
     return {
-        "vehiculo_detectado": conf_m2 > 0.0,
-        "categoria": categoria,
-        "conf_vehiculo": conf_m2,
-        "bbox_vehiculo": bbox_vehiculo_norm,
-        "mask_vehiculo": mask_v_norm if conf_m2 > 0.0 else None,
-        "placa_detectada": m1_ok,
-        "placa": placa_norm,
-        "conf_ocr": conf_ocr,
-        "bbox_placa": bbox_placa_norm,
-        "ejes": ejes,
-        "llantas": llantas_det,
-        "llantas_puntos": llantas_norm,
-        "llantas_boxes": llantas_boxes,
+        "detecciones": detecciones_estables,
+        "total_vehiculos": len(detecciones_estables),
+        "vehiculo_detectado": principal is not None,
+        "categoria": principal["categoria"] if principal else "auto",
+        "ejes": principal["ejes"] if principal else 2,
+        "pasajeros": principal["pasajeros"] if principal else 0,
         "latencia_ms": latencia_ms,
         "device": DEVICE,
     }
@@ -513,12 +704,13 @@ async def vigilancia_http(imagen: UploadFile = File(...)):
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
         raise HTTPException(status_code=400, detail="Frame inválido.")
-    return analizar_frame_vigilancia(img)
+    return analizar_frame_vigilancia(img, rastreador_http)
 
 
 @app.websocket("/ws/vigilancia")
 async def ws_vigilancia(websocket: WebSocket):
     await websocket.accept()
+    rastreador_ws = RastreadorVigilancia()
     try:
         while True:
             frame_bytes = await websocket.receive_bytes()
@@ -527,7 +719,7 @@ async def ws_vigilancia(websocket: WebSocket):
             if img is None:
                 await websocket.send_json({"error": "frame_invalido"})
                 continue
-            resultado = analizar_frame_vigilancia(img)
+            resultado = analizar_frame_vigilancia(img, rastreador_ws)
             await websocket.send_json(resultado)
     except WebSocketDisconnect:
         pass

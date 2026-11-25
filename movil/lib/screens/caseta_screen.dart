@@ -52,7 +52,7 @@ Uint8List _convertirFrameAJpeg(_RawFrame frame) {
       order: img.ChannelOrder.bgra,
     );
   } else if (frame.planes.length >= 3) {
-    final step = frame.width > 640 ? 2 : 1;
+    final step = frame.width > 1280 ? 2 : 1;
     final outW = (frame.width + step - 1) ~/ step;
     final outH = (frame.height + step - 1) ~/ step;
     decoded = img.Image(width: outW, height: outH);
@@ -133,11 +133,11 @@ Uint8List _convertirFrameAJpeg(_RawFrame frame) {
       ? img.copyRotate(decoded, angle: frame.sensorOrientation)
       : decoded;
 
-  if (orientada.width > 384) {
-    orientada = img.copyResize(orientada, width: 384);
+  if (orientada.width > 960) {
+    orientada = img.copyResize(orientada, width: 960);
   }
 
-  return Uint8List.fromList(img.encodeJpg(orientada, quality: 60));
+  return Uint8List.fromList(img.encodeJpg(orientada, quality: 82));
 }
 
 class CasetaScreen extends StatefulWidget {
@@ -212,7 +212,7 @@ class _CasetaScreenState extends State<CasetaScreen> {
 
     _cameraController = CameraController(
       trasera,
-      ResolutionPreset.medium,
+      ResolutionPreset.high,
       enableAudio: false,
       imageFormatGroup: Platform.isIOS
           ? ImageFormatGroup.bgra8888
@@ -426,21 +426,26 @@ class _CasetaScreenState extends State<CasetaScreen> {
         _deteccionActual = decoded;
       });
 
-      final placaDetectada = decoded['placa_detectada'] == true;
-      final placa = (decoded['placa'] ?? '').toString().trim();
-      final confOcr = (decoded['conf_ocr'] as num?)?.toDouble() ?? 0.0;
+      final List<dynamic> lista = decoded['detecciones'] is List
+          ? decoded['detecciones'] as List<dynamic>
+          : [decoded];
 
-      if (placaDetectada &&
-          placa.isNotEmpty &&
-          placa != 'ILEGIBLE' &&
-          confOcr >= 0.75) {
-        final ahora = DateTime.now();
-        final ultimo = _ultimosRegistros[placa];
-        if ((ultimo == null || ahora.difference(ultimo).inSeconds >= 30) &&
-            !_registrandoPaso &&
-            _ultimoFrameJpeg != null) {
-          _ultimosRegistros[placa] = ahora;
-          _registrarPasoEnSegundoPlano(_ultimoFrameJpeg!, placa);
+      for (final item in lista) {
+        if (item is! Map) continue;
+        final confirmado = item['confirmado'] == true ||
+            (item['placa_detectada'] == true &&
+                ((item['conf_ocr'] as num?)?.toDouble() ?? 0.0) >= 0.75);
+        final placa = (item['placa'] ?? '').toString().trim();
+        if (confirmado && placa.isNotEmpty && placa != 'ILEGIBLE') {
+          final ahora = DateTime.now();
+          final ultimo = _ultimosRegistros[placa];
+          if ((ultimo == null || ahora.difference(ultimo).inSeconds >= 30) &&
+              !_registrandoPaso &&
+              _ultimoFrameJpeg != null) {
+            _ultimosRegistros[placa] = ahora;
+            _registrarPasoEnSegundoPlano(_ultimoFrameJpeg!, placa);
+            break;
+          }
         }
       }
     } catch (_) {
@@ -799,7 +804,7 @@ class _CasetaScreenState extends State<CasetaScreen> {
                             const SizedBox(width: 6),
                             Text(
                               _wsConectado
-                                  ? '${_usarHttpFallback ? "EN VIVO (HTTP)" : "EN VIVO"}${_deteccionActual != null ? " • ${_deteccionActual!['latencia_ms'] ?? ''}ms (${_deteccionActual!['device'] ?? ''}) • ${(_deteccionActual!['categoria'] ?? '').toString().toUpperCase()} ${_deteccionActual!['ejes'] ?? ''}e" : ""}'
+                                  ? '${_usarHttpFallback ? "EN VIVO (HTTP)" : "EN VIVO"}${_deteccionActual != null ? " • ${_deteccionActual!['latencia_ms'] ?? ''}ms • ${_deteccionActual!['total_vehiculos'] ?? 0} veh" : ""}'
                                   : 'DESCONECTADO',
                               style: const TextStyle(
                                 color: Colors.white,
@@ -981,7 +986,7 @@ class _CasetaScreenState extends State<CasetaScreen> {
                   ),
                 ),
                 Text(
-                  '${(paso['categoria_detectada'] ?? '').toString().toUpperCase()} • ${paso['ejes_detectados'] ?? 2} ejes • Bs. ${paso['monto']}',
+                  '${(paso['categoria_detectada'] ?? '').toString().toUpperCase()} • ${paso['ejes_detectados'] ?? 2} ejes • ${paso['pasajeros'] ?? 0} pas. • Bs. ${paso['monto']}',
                   style: const TextStyle(
                     color: Color(0xFFCBD5E1),
                     fontSize: 12,

@@ -113,7 +113,7 @@
                                     <tr class="hover:bg-slate-800/40">
                                         <td class="px-4 py-3 text-slate-400">{{ $paso->created_at->format('H:i:s') }}</td>
                                         <td class="px-4 py-3 font-mono font-bold">{{ $paso->placa_normalizada ?? 'ILEGIBLE' }}</td>
-                                        <td class="px-4 py-3 capitalize">{{ $paso->categoria_detectada }} ({{ $paso->ejes_detectados }} ejes)</td>
+                                        <td class="px-4 py-3 capitalize">{{ $paso->categoria_detectada }} ({{ $paso->ejes_detectados }} ejes • {{ $paso->pasajeros ?? 0 }} pas.)</td>
                                         <td class="px-4 py-3 font-semibold">Bs. {{ number_format($paso->monto, 2) }}</td>
                                         <td class="px-4 py-3">
                                             <span class="px-2 py-0.5 rounded-full text-xs border {{ $badge }}">{{ $paso->estado }}</span>
@@ -336,7 +336,7 @@
                     <tr class="bg-indigo-950/30 transition">
                         <td class="px-4 py-3 text-slate-400">${d.hora}</td>
                         <td class="px-4 py-3 font-mono font-bold">${d.placa}</td>
-                        <td class="px-4 py-3 capitalize">${d.categoria} (${d.ejes} ejes)</td>
+                        <td class="px-4 py-3 capitalize">${d.categoria} (${d.ejes} ejes • ${d.pasajeros ?? 0} pas.)</td>
                         <td class="px-4 py-3 font-semibold">Bs. ${Number(d.monto).toFixed(2)}</td>
                         <td class="px-4 py-3"><span class="px-2 py-0.5 rounded-full text-xs border ${badgeClass}">${d.estado}</span></td>
                         <td class="px-4 py-3">${fotoHtml}</td>
