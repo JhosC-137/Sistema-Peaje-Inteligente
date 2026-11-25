@@ -52,24 +52,66 @@ Uint8List _convertirFrameAJpeg(_RawFrame frame) {
       bytes: frame.planes[0].buffer,
       order: img.ChannelOrder.bgra,
     );
-  } else {
+  } else if (frame.planes.length >= 3) {
     decoded = img.Image(width: frame.width, height: frame.height);
     final yPlane = frame.planes[0];
     final uPlane = frame.planes[1];
     final vPlane = frame.planes[2];
     final yStride = frame.bytesPerRow[0];
-    final uvStride = frame.bytesPerRow[1];
-    final uvPixelStride = frame.bytesPerPixel[1];
+    final uStride = frame.bytesPerRow[1];
+    final vStride = frame.bytesPerRow[2];
+    final uPixelStride = frame.bytesPerPixel[1];
+    final vPixelStride = frame.bytesPerPixel[2];
+
+    for (int y = 0; y < frame.height; y++) {
+      final yRow = y * yStride;
+      final uRow = (y >> 1) * uStride;
+      final vRow = (y >> 1) * vStride;
+      for (int x = 0; x < frame.width; x++) {
+        final yIdx = yRow + x;
+        final uIdx = uRow + (x >> 1) * uPixelStride;
+        final vIdx = vRow + (x >> 1) * vPixelStride;
+        final yVal = yIdx < yPlane.length ? yPlane[yIdx] : 0;
+        final uVal = (uIdx < uPlane.length ? uPlane[uIdx] : 128) - 128;
+        final vVal = (vIdx < vPlane.length ? vPlane[vIdx] : 128) - 128;
+
+        int r = (yVal + 1.370705 * vVal).round();
+        int g = (yVal - 0.337633 * uVal - 0.698001 * vVal).round();
+        int b = (yVal + 1.732446 * uVal).round();
+
+        decoded.setPixelRgb(
+          x,
+          y,
+          r.clamp(0, 255),
+          g.clamp(0, 255),
+          b.clamp(0, 255),
+        );
+      }
+    }
+  } else {
+    // Fallback para formatos de 1 o 2 planos (ej. NV21 / Y solo)
+    decoded = img.Image(width: frame.width, height: frame.height);
+    final yPlane = frame.planes[0];
+    final yStride = frame.bytesPerRow[0];
+    final hasUv = frame.planes.length >= 2;
+    final uvPlane = hasUv ? frame.planes[1] : null;
+    final uvStride = hasUv ? frame.bytesPerRow[1] : 0;
 
     for (int y = 0; y < frame.height; y++) {
       final yRow = y * yStride;
       final uvRow = (y >> 1) * uvStride;
       for (int x = 0; x < frame.width; x++) {
-        final yVal = yPlane[yRow + x];
-        final uvIndex = uvRow + (x >> 1) * uvPixelStride;
-        final uVal = uPlane[uvIndex] - 128;
-        final vVal = vPlane[uvIndex] - 128;
-
+        final yIdx = yRow + x;
+        final yVal = yIdx < yPlane.length ? yPlane[yIdx] : 0;
+        int uVal = 0;
+        int vVal = 0;
+        if (uvPlane != null) {
+          final uvIdx = uvRow + (x & ~1);
+          if (uvIdx + 1 < uvPlane.length) {
+            vVal = uvPlane[uvIdx] - 128;
+            uVal = uvPlane[uvIdx + 1] - 128;
+          }
+        }
         int r = (yVal + 1.370705 * vVal).round();
         int g = (yVal - 0.337633 * uVal - 0.698001 * vVal).round();
         int b = (yVal + 1.732446 * uVal).round();
@@ -142,11 +184,19 @@ class _CasetaScreenState extends State<CasetaScreen> {
 
   Future<void> _cargarConfig() async {
     final prefs = await SharedPreferences.getInstance();
-    if (!mounted) return;
-    setState(() {
-      _operador = prefs.getString('user_nombre') ?? 'Operador';
-      _wsUrl = prefs.getString('ws_vigilancia_url') ?? AppConfig.wsVigilanciaUrl;
-    });
+    final urlGuardada = prefs.getString('ws_vigilancia_url');
+    if (mounted) {
+      setState(() {
+        _operador = prefs.getString('user_nombre') ?? 'Operador';
+        _wsUrl = urlGuardada ?? AppConfig.wsVigilanciaUrl;
+      });
+    }
+    if (urlGuardada == null || urlGuardada.isEmpty) {
+      final remota = await ApiService.obtenerInferenceUrl();
+      if (remota != null && mounted) {
+        setState(() => _wsUrl = _normalizarWsUrl(remota));
+      }
+    }
   }
 
   Future<void> _iniciarCamara() async {
@@ -220,6 +270,15 @@ class _CasetaScreenState extends State<CasetaScreen> {
       _deteccionActual = null;
     });
 
+    final prefs = await SharedPreferences.getInstance();
+    final urlGuardada = prefs.getString('ws_vigilancia_url');
+    if (urlGuardada == null || urlGuardada.isEmpty) {
+      final remota = await ApiService.obtenerInferenceUrl();
+      if (remota != null && mounted) {
+        setState(() => _wsUrl = _normalizarWsUrl(remota));
+      }
+    }
+
     await _conectarWebSocket();
     if (_modoVigilanciaActivo) {
       await _iniciarStreamCamara();
@@ -279,8 +338,7 @@ class _CasetaScreenState extends State<CasetaScreen> {
       }
       if (_esperandoRespuestaWs) {
         final ultimo = _ultimoEnvioWs;
-        if (ultimo == null ||
-            DateTime.now().difference(ultimo).inSeconds < 5) {
+        if (ultimo == null || DateTime.now().difference(ultimo).inSeconds < 5) {
           return;
         }
       }
@@ -297,12 +355,11 @@ class _CasetaScreenState extends State<CasetaScreen> {
       final raw = _RawFrame(
         width: image.width,
         height: image.height,
-        sensorOrientation: _cameraController?.description.sensorOrientation ?? 0,
+        sensorOrientation:
+            _cameraController?.description.sensorOrientation ?? 0,
         planes: image.planes.map((p) => Uint8List.fromList(p.bytes)).toList(),
         bytesPerRow: image.planes.map((p) => p.bytesPerRow).toList(),
-        bytesPerPixel: image.planes
-            .map((p) => p.bytesPerPixel ?? 1)
-            .toList(),
+        bytesPerPixel: image.planes.map((p) => p.bytesPerPixel ?? 1).toList(),
         isBgra: image.format.group == ImageFormatGroup.bgra8888,
       );
 
@@ -343,9 +400,11 @@ class _CasetaScreenState extends State<CasetaScreen> {
       }
     } catch (e) {
       _esperandoRespuestaWs = false;
-      if (_usarHttpFallback && mounted) {
+      if (mounted) {
         setState(() {
-          _errorMsg = 'Sin conexión con Colab. Actualiza la URL en 🔗.';
+          _errorMsg = _usarHttpFallback
+              ? 'Sin conexión con Colab/RunPod. Revisa URL en 🔗 ($e)'
+              : 'Error enviando frame: $e';
         });
       }
     } finally {
@@ -587,7 +646,10 @@ class _CasetaScreenState extends State<CasetaScreen> {
         actions: [
           IconButton(
             onPressed: _abrirConsulta,
-            icon: const Icon(Icons.smart_toy_outlined, color: Color(0xFF38BDF8)),
+            icon: const Icon(
+              Icons.smart_toy_outlined,
+              color: Color(0xFF38BDF8),
+            ),
             tooltip: 'Modo Consulta (Agente)',
           ),
           IconButton(
@@ -715,8 +777,8 @@ class _CasetaScreenState extends State<CasetaScreen> {
                             Text(
                               _wsConectado
                                   ? (_usarHttpFallback
-                                        ? 'EN VIVO (HTTP)'
-                                        : 'EN VIVO')
+                                        ? 'EN VIVO (HTTP)${_deteccionActual != null ? " • ${(_deteccionActual!['categoria'] ?? '').toString().toUpperCase()} ${_deteccionActual!['ejes'] ?? ''}e" : ""}'
+                                        : 'EN VIVO${_deteccionActual != null ? " • ${(_deteccionActual!['categoria'] ?? '').toString().toUpperCase()} ${_deteccionActual!['ejes'] ?? ''}e" : ""}')
                                   : 'DESCONECTADO',
                               style: const TextStyle(
                                 color: Colors.white,
@@ -853,7 +915,8 @@ class _CasetaScreenState extends State<CasetaScreen> {
           if (imagenBytes != null ||
               (imagenUrl != null && imagenUrl.isNotEmpty))
             GestureDetector(
-              onTap: () => _verImagenAnotada(bytes: imagenBytes, url: imagenUrl),
+              onTap: () =>
+                  _verImagenAnotada(bytes: imagenBytes, url: imagenUrl),
               child: Padding(
                 padding: const EdgeInsets.only(right: 12),
                 child: ClipRRect(

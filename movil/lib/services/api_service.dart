@@ -87,6 +87,30 @@ class ApiService {
     await prefs.clear();
   }
 
+  static Future<String?> obtenerInferenceUrl() async {
+    final prefs = await SharedPreferences.getInstance();
+    final token = prefs.getString('auth_token');
+    if (token == null) return null;
+
+    try {
+      final res = await http
+          .get(
+            Uri.parse('${AppConfig.baseUrl}/v1/estado'),
+            headers: {
+              'Authorization': 'Bearer $token',
+              'Accept': 'application/json',
+            },
+          )
+          .timeout(const Duration(seconds: 12));
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body) as Map<String, dynamic>;
+        final url = data['inference_url']?.toString().trim();
+        if (url != null && url.isNotEmpty) return url;
+      }
+    } catch (_) {}
+    return null;
+  }
+
   static Future<Map<String, dynamic>> consultarAgenteTexto(
     String pregunta,
   ) async {

@@ -121,7 +121,7 @@ def _detectar_placa_y_ocr_detalle(img: np.ndarray) -> tuple[str, str, float, boo
                 scores = dets[:, 4]
                 boxes = dets[:, :4]
 
-            validos = np.where(scores >= 0.35)[0]
+            validos = np.where(scores >= 0.25)[0]
             if len(validos) > 0:
                 mejor = validos[int(np.argmax(scores[validos]))]
                 bx1, by1, bx2, by2 = boxes[mejor]
@@ -188,7 +188,7 @@ SEPARACION_EJE = 0.52
 
 def _clasificar_vehiculo_detalle(img: np.ndarray) -> tuple[str, float, list[float], list[list[float]] | None]:
     """Etapa 2: Retorna categoría, confianza, caja [x1, y1, x2, y2] y polígono normalizado."""
-    res_m2 = modelo_m2.predict(img, conf=0.40, device=DEVICE, verbose=False)[0]
+    res_m2 = modelo_m2.predict(img, conf=0.25, device=DEVICE, verbose=False)[0]
     if res_m2.boxes is None or len(res_m2.boxes) == 0:
         return "auto", 0.0, [0.0, 0.0, float(img.shape[1]), float(img.shape[0])], None
 
@@ -232,7 +232,7 @@ def _contar_ejes_detalle(
     if modelo_m3 is None:
         return (3 if categoria == "camion" else 2), 0, [], []
 
-    res_m3 = modelo_m3.predict(img, conf=0.35, device=DEVICE, verbose=False)[0]
+    res_m3 = modelo_m3.predict(img, conf=0.25, device=DEVICE, verbose=False)[0]
     if res_m3.keypoints is None or res_m3.boxes is None or len(res_m3.boxes) == 0:
         return 2, 0, [], []
 
@@ -315,7 +315,7 @@ def dibujar_detecciones(
     h, w = canvas.shape[:2]
 
     # 1. Máscara de segmentación semitransparente + caja del vehículo (M2)
-    if conf_m2 > 0.40:
+    if conf_m2 > 0.0:
         if mask_v_norm:
             pts = np.array([[int(p[0] * w), int(p[1] * h)] for p in mask_v_norm], dtype=np.int32)
             overlay = canvas.copy()
@@ -417,7 +417,7 @@ async def inferir(imagen: UploadFile = File(...)):
     )
     bbox_vehiculo_norm = (
         [round(bbox_vehiculo[0] / w, 4), round(bbox_vehiculo[1] / h, 4), round(bbox_vehiculo[2] / w, 4), round(bbox_vehiculo[3] / h, 4)]
-        if conf_m2 > 0.40 and w > 0 and h > 0
+        if conf_m2 > 0.0 and w > 0 and h > 0
         else None
     )
 
@@ -430,7 +430,7 @@ async def inferir(imagen: UploadFile = File(...)):
         "pasajeros": 0,
         "latencia": latencia_ms,
         "bbox_vehiculo": bbox_vehiculo_norm,
-        "mask_vehiculo": mask_v_norm if conf_m2 > 0.40 else None,
+        "mask_vehiculo": mask_v_norm if conf_m2 > 0.0 else None,
         "bbox_placa": bbox_placa_norm,
         "llantas_puntos": llantas_norm,
         "llantas_boxes": llantas_boxes,
@@ -458,16 +458,16 @@ def analizar_frame_vigilancia(img: np.ndarray) -> dict:
         bbox_placa_norm = [round(x1 / w, 4), round(y1 / h, 4), round(x2 / w, 4), round(y2 / h, 4)]
 
     bbox_vehiculo_norm = None
-    if conf_m2 > 0.40 and w > 0 and h > 0:
+    if conf_m2 > 0.0 and w > 0 and h > 0:
         vx1, vy1, vx2, vy2 = bbox_v
         bbox_vehiculo_norm = [round(vx1 / w, 4), round(vy1 / h, 4), round(vx2 / w, 4), round(vy2 / h, 4)]
 
     return {
-        "vehiculo_detectado": conf_m2 > 0.40,
+        "vehiculo_detectado": conf_m2 > 0.0,
         "categoria": categoria,
         "conf_vehiculo": conf_m2,
         "bbox_vehiculo": bbox_vehiculo_norm,
-        "mask_vehiculo": mask_v_norm if conf_m2 > 0.40 else None,
+        "mask_vehiculo": mask_v_norm if conf_m2 > 0.0 else None,
         "placa_detectada": m1_ok,
         "placa": placa_norm,
         "conf_ocr": conf_ocr,

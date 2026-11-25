@@ -49,18 +49,21 @@ class DashboardController extends Controller
                 return response()->json([
                     'online' => true,
                     'url_configurada' => true,
+                    'inference_url' => rtrim($inferenceUrl, '/'),
                     'detalle' => $res->json(),
                 ]);
             }
             return response()->json([
                 'online' => false,
                 'url_configurada' => true,
+                'inference_url' => rtrim($inferenceUrl, '/'),
                 'mensaje' => 'HTTP ' . $res->status(),
             ]);
         } catch (\Throwable $e) {
             return response()->json([
                 'online' => false,
                 'url_configurada' => true,
+                'inference_url' => rtrim($inferenceUrl, '/'),
                 'mensaje' => 'Sin conexión con el servidor IA',
             ]);
         }
